@@ -48,6 +48,7 @@ class SyncProgressPopup {
       this.el.style.display = "none";
       if (this.fill) this.fill.style.width = "0%";
     }
+    this.lastUpdate = 0;
   }
 
   destroy(): void {
