@@ -1,4 +1,3 @@
-```ts
 import { normalizePath } from "obsidian";
 import type { AnilistClient } from "../anilist/client";
 import {
@@ -357,4 +356,3 @@ async function pMapLimit<T>(items: T[], limit: number, fn: (item: T, idx: number
   };
   await Promise.all(Array.from({ length: workers }, () => worker()));
 }
-```
