@@ -99,7 +99,7 @@ export default class AnisyncPlugin extends Plugin {
       name: "Disconnect AniList",
       checkCallback: (checking) => {
         if (checking) return !!this.settings.anilistToken;
-        void disconnectAnilist(this).then(() => {
+        void this.disconnectAnilist().then(() => {
           this.refreshSettingsTab();
           new Notice("Disconnected from AniList.", 3000);
         });
@@ -170,6 +170,8 @@ export default class AnisyncPlugin extends Plugin {
   }
 
   async disconnectAnilist(): Promise<void> {
+    this.syncEngine?.cancel();
+    this.syncPopup.hide();
     await disconnectAnilist(this);
   }
 
