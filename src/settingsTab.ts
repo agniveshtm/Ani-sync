@@ -24,6 +24,7 @@ export class AnisyncSettingTab extends PluginSettingTab {
     this.safeRender("Sync", () => this.renderSyncSection(containerEl));
     this.safeRender("SyncSettings", () => this.renderSyncSettingsSection(containerEl));
     this.safeRender("OpenRouter", () => this.renderOpenRouterSection(containerEl));
+    this.safeRender("GraphColors", () => this.renderGraphColorsSection(containerEl));
     this.safeRender("Actions", () => this.renderActionsSection(containerEl));
   }
 
@@ -244,6 +245,50 @@ export class AnisyncSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         });
       });
+  }
+
+  private renderGraphColorsSection(containerEl: HTMLElement): void {
+    const s = this.plugin.settings;
+    const colors = s.graphColors;
+    const labels: [keyof typeof colors, string, string][] = [
+      ["anime", "Anime", "#02a9ff"],
+      ["manga", "Manga", "#8b5cf6"],
+      ["staff", "Staff", "#4ade80"],
+      ["studios", "Studios", "#f59e0b"],
+      ["tags", "Tags", "#f87171"],
+      ["characters", "Characters", "#fbbf24"],
+      ["voiceActors", "Voice Actors", "#e879f9"],
+    ];
+
+    containerEl.createEl("h3", { text: "Graph Colors" });
+    containerEl.createEl("p", {
+      text: "Customise the colours used for each note type in Obsidian's graph view.",
+      cls: "setting-item-description",
+    });
+
+    for (const [key, label, _default] of labels) {
+      new Setting(containerEl)
+        .setName(label)
+        .addColorPicker((picker) =>
+          picker
+            .setValue(colors[key])
+            .onChange(async (value) => {
+              colors[key] = value;
+              await this.plugin.saveSettings();
+              await this.plugin.applyGraphColors();
+            }),
+        );
+    }
+
+    new Setting(containerEl)
+      .setName("Apply to graph now")
+      .setDesc("Update graph.json with the colours above.")
+      .addButton((btn) =>
+        btn.setButtonText("Apply").setCta().onClick(async () => {
+          await this.plugin.applyGraphColors();
+          new Notice("Graph colours applied. Reopen the graph panel to see changes.", 6000);
+        }),
+      );
   }
 
   private renderActionsSection(containerEl: HTMLElement): void {

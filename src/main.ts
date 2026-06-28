@@ -223,6 +223,40 @@ export default class AnisyncPlugin extends Plugin {
     this.settingTab?.display();
   }
 
+  async applyGraphColors(): Promise<void> {
+    try {
+      const path = ".obsidian/graph.json";
+      const adapter = this.app.vault.adapter;
+      const raw = await adapter.exists(path) ? await adapter.read(path) : "{}";
+      const graph = JSON.parse(raw);
+      const groups: Record<string, unknown>[] = graph.groups ?? [];
+      const kept = groups.filter((g: Record<string, unknown>) => {
+        const q = g.query as string ?? "";
+        return !q.startsWith(`path:${this.settings.outputDir}/`);
+      });
+      const folderMap: Record<string, string> = {
+        anime: "Anime",
+        manga: "Manga",
+        staff: "Staff",
+        studios: "Studios",
+        tags: "Tags",
+        characters: "Characters",
+        voiceActors: "Voice-Actors",
+      };
+      for (const [key, folder] of Object.entries(folderMap)) {
+        const hex = (this.settings.graphColors as unknown as Record<string, string>)[key] ?? "#ffffff";
+        kept.push({
+          query: `path:${this.settings.outputDir}/${folder}`,
+          color: { rgb: parseInt(hex.replace("#", ""), 16) },
+        });
+      }
+      graph.groups = kept;
+      await adapter.write(path, JSON.stringify(graph, null, 2));
+    } catch (e) {
+      console.error("Ani-sync: failed to apply graph colors", e);
+    }
+  }
+
   async runSync(): Promise<void> {
     if (this.syncEngine) {
       new Notice("Ani-sync: sync already in progress.", 4000);
@@ -267,6 +301,7 @@ export default class AnisyncPlugin extends Plugin {
       this.settings.lastSyncAt = new Date().toISOString();
       this.settings.lastSyncStats = `${stats.created} created, ${stats.updated} updated, ${stats.skipped} unchanged, ${stats.failed} failed`;
       await this.saveAll();
+      try { await this.applyGraphColors(); } catch {}
       this.syncPopup.show("Sync complete!", 100);
       setTimeout(() => this.syncPopup.hide(), 2000);
       new Notice(`Ani-sync: done — ${stats.created} created, ${stats.updated} updated, ${stats.skipped} skipped, ${stats.failed} failed`, 6000);

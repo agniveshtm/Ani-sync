@@ -1,5 +1,15 @@
 import type { OpenRouterModel } from "./openrouter/types";
 
+export interface GraphColors {
+  anime: string;
+  manga: string;
+  staff: string;
+  studios: string;
+  tags: string;
+  characters: string;
+  voiceActors: string;
+}
+
 export interface AnisyncSettings {
   anilistToken: string;
   anilistUsername: string;
@@ -11,7 +21,18 @@ export interface AnisyncSettings {
   openrouterApiKey: string;
   openrouterModel: string;
   openrouterAvailableModels: OpenRouterModel[];
+  graphColors: GraphColors;
 }
+
+export const DEFAULT_GRAPH_COLORS: GraphColors = {
+  anime: "#02a9ff",
+  manga: "#8b5cf6",
+  staff: "#4ade80",
+  studios: "#f59e0b",
+  tags: "#f87171",
+  characters: "#fbbf24",
+  voiceActors: "#e879f9",
+};
 
 export const DEFAULT_SETTINGS: AnisyncSettings = {
   anilistToken: "",
@@ -24,4 +45,5 @@ export const DEFAULT_SETTINGS: AnisyncSettings = {
   openrouterApiKey: "",
   openrouterModel: "",
   openrouterAvailableModels: [],
+  graphColors: { ...DEFAULT_GRAPH_COLORS },
 };

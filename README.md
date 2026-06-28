@@ -70,11 +70,11 @@ Every Anime/Manga note links out to studios, staff, tags, and relations with `[[
 - **Ribbon icons**:
   - (database) — click to sync now.
   - (message-circle) — open AI chat sidebar.
-- **Command palette**:
-  - `Ani-sync: Sync now`
-  - `Ani-sync: Disconnect AniList`
-  - `Ani-sync: Clear sync cache (force full re-sync)`
-  - `Ani-sync: Open Ani-sync Chat`
+- **Command palette / Hotkeys**:
+  - `Ani-sync: Sync now` — `Ctrl+Shift+S`
+  - `Ani-sync: Disconnect AniList` — `Ctrl+Shift+D`
+  - `Ani-sync: Clear sync cache (force full re-sync)` — `Ctrl+Shift+C`
+  - `Ani-sync: Open Ani-sync Chat` — `Ctrl+Shift+O`
 - **Settings tab**:
   - **Sync now** button (same as the ribbon icon).
   - **Clear sync cache** button — next sync re-fetches every entry.
