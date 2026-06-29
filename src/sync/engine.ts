@@ -275,6 +275,12 @@ export class SyncEngine {
       const cachedHash = noteHashes[a.uniqueKey];
 
       try {
+        // Delete old file if slug/path changed (rename handling)
+        const oldPath = paths[a.uniqueKey];
+        if (oldPath && oldPath !== vaultPath) {
+          try { await this.vault.delete(oldPath); } catch { /* already gone */ }
+        }
+
         if (cachedHash === noteHash) {
           stats.skipped += 1;
           noteHashes[a.uniqueKey] = noteHash;

@@ -330,8 +330,6 @@ export default class AnisyncPlugin extends Plugin {
 
     const rules: string[] = [];
 
-    // Obsidian graph nodes are SVG <g> elements with <text> children
-    // Target by file path using data-path attribute on the node groups
     const folderMap: [string, string][] = [
       ["/Anime/", colors.anime],
       ["/Manga/", colors.manga],
@@ -343,22 +341,19 @@ export default class AnisyncPlugin extends Plugin {
 
     for (const [folder, color] of folderMap) {
       if (!color) continue;
-      // Target graph nodes by matching file path in their data or text
-      rules.push(`.graph-view .graph-node[data-path*="${outputDir}${folder}"] circle { fill: ${color} !important; }`);
-      rules.push(`.graph-view .graph-node[data-path*="${outputDir}${folder}"] text { fill: ${color} !important; }`);
-      // Fallback: target by link text content
-      rules.push(`.graph-view .graph-node:has(text:is("${folder.replace(/\//g, "")}")) circle { fill: ${color} !important; }`);
+      rules.push(`.graph-view .graph-node[data-path*="${outputDir}${folder}"] > circle { fill: ${color} !important; stroke: ${color} !important; }`);
+      rules.push(`.graph-view .graph-node[data-path*="${outputDir}${folder}"] > text { fill: ${color} !important; }`);
     }
 
-    // Also set Obsidian's CSS custom properties for graph colors
-    const colorValues = [colors.anime, colors.manga, colors.staff, colors.studios, colors.tags, colors.characters].filter(Boolean);
-    if (colorValues.length > 0) {
-      rules.push(`.graph-view { --graph-color-0: ${colorValues[0]}; }`);
-      if (colorValues[1]) rules.push(`.graph-view { --graph-color-1: ${colorValues[1]}; }`);
-      if (colorValues[2]) rules.push(`.graph-view { --graph-color-2: ${colorValues[2]}; }`);
-      if (colorValues[3]) rules.push(`.graph-view { --graph-color-3: ${colorValues[3]}; }`);
-      if (colorValues[4]) rules.push(`.graph-view { --graph-color-4: ${colorValues[4]}; }`);
-      if (colorValues[5]) rules.push(`.graph-view { --graph-color-5: ${colorValues[5]}; }`);
+    // Set CSS custom properties so Obsidian's native color system picks them up
+    const vals = [colors.anime, colors.manga, colors.staff, colors.studios, colors.tags, colors.characters].filter(Boolean);
+    if (vals.length) {
+      rules.push(`.graph-view.graph-view.color-circle { --graph-color-0: ${vals[0]}; }`);
+      if (vals[1]) rules.push(`.graph-view { --graph-color-1: ${vals[1]}; }`);
+      if (vals[2]) rules.push(`.graph-view { --graph-color-2: ${vals[2]}; }`);
+      if (vals[3]) rules.push(`.graph-view { --graph-color-3: ${vals[3]}; }`);
+      if (vals[4]) rules.push(`.graph-view { --graph-color-4: ${vals[4]}; }`);
+      if (vals[5]) rules.push(`.graph-view { --graph-color-5: ${vals[5]}; }`);
     }
 
     const css = rules.join("\n");

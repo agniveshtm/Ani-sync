@@ -176,20 +176,27 @@ export class VaultContext {
     this.basePath = basePath;
   }
 
+  private loadingPromise: Promise<void> | null = null;
+
   async load(): Promise<void> {
     if (this.loaded) return;
-    const folder = this.app.vault.getAbstractFileByPath(this.basePath);
-    if (!folder) return;
+    if (this.loadingPromise) return this.loadingPromise;
 
-    const files = this.getAllMarkdownFiles(folder);
-    for (const file of files) {
-      const node = await this.parseFile(file);
-      if (node) this.nodes.push(node);
-    }
-    this.loaded = true;
+    this.loadingPromise = (async () => {
+      const folder = this.app.vault.getAbstractFileByPath(this.basePath);
+      if (!folder) return;
 
-    this.index = new SearchIndex();
-    this.index.build(this.nodes);
+      const files = this.getAllMarkdownFiles(folder);
+      for (const file of files) {
+        const node = await this.parseFile(file);
+        if (node) this.nodes.push(node);
+      }
+      this.loaded = true;
+      this.index = new SearchIndex();
+      this.index.build(this.nodes);
+    })();
+
+    return this.loadingPromise;
   }
 
   private getAllMarkdownFiles(folder: any): TFile[] {
@@ -284,7 +291,32 @@ export class VaultContext {
 
   search(query: string): VaultSearchResult[] {
     if (!this.index) return [];
-    return this.index.search(query);
+    const results = this.index.search(query);
+
+    // If top results are low-scored, try multi-term intersection fallback
+    if (results.length === 0 || results[0].score < 30) {
+      const tokens = query.toLowerCase().trim().split(/[\s,.\-!?()]+/).filter(t => t.length > 2);
+      if (tokens.length >= 2) {
+        const intersectResults: VaultSearchResult[] = [];
+        for (const node of this.nodes) {
+          const allText = `${node.title} ${node.body}`.toLowerCase();
+          const matchCount = tokens.filter(t => allText.includes(t)).length;
+          if (matchCount === tokens.length) {
+            intersectResults.push({
+              node,
+              score: 50 + matchCount * 5,
+              matchedField: `multi:${tokens.join("+")}`,
+            });
+          }
+        }
+        if (intersectResults.length > 0) {
+          intersectResults.sort((a, b) => b.score - a.score);
+          return intersectResults.slice(0, 20);
+        }
+      }
+    }
+
+    return results;
   }
 
   getAllMedia(): VaultNode[] { return this.nodes.filter((n) => n.type === "anime" || n.type === "manga"); }
@@ -302,7 +334,7 @@ export class VaultContext {
       "---",
     ];
 
-    for (const r of results) {
+    for (const r of results.slice(0, 10)) {
       const n = r.node;
       const lines: string[] = [];
       lines.push(`${n.type.toUpperCase()}: "${n.title}"`);
@@ -316,11 +348,12 @@ export class VaultContext {
       if (n.frontmatter.language) lines.push(`  Language: ${n.frontmatter.language}`);
       if (n.frontmatter.tags && Array.isArray(n.frontmatter.tags)) lines.push(`  Tags: ${n.frontmatter.tags.join(", ")}`);
 
+      // Include the full body content
       const bodyLines = n.body.split("\n");
-      let inSection = "";
       for (const line of bodyLines) {
-        if (line.startsWith("## ")) inSection = line.slice(3).trim();
-        else if (inSection && line.startsWith("- ")) lines.push(`  ${inSection}: ${line.slice(2)}`);
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("![") || trimmed.startsWith("|")) continue;
+        lines.push(`  ${trimmed}`);
       }
 
       lines.push(`  Matched via: ${r.matchedField} (score: ${r.score.toFixed(1)})`);
