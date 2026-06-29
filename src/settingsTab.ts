@@ -24,6 +24,7 @@ export class AnisyncSettingTab extends PluginSettingTab {
     this.safeRender("Sync", () => this.renderSyncSection(containerEl));
     this.safeRender("SyncSettings", () => this.renderSyncSettingsSection(containerEl));
     this.safeRender("OpenRouter", () => this.renderOpenRouterSection(containerEl));
+    this.safeRender("GraphColors", () => this.renderGraphColorsSection(containerEl));
     this.safeRender("Actions", () => this.renderActionsSection(containerEl));
   }
 
@@ -244,6 +245,52 @@ export class AnisyncSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         });
       });
+  }
+
+  private renderGraphColorsSection(containerEl: HTMLElement): void {
+    const s = this.plugin.settings;
+    const colors = s.graphColors;
+    const labels: [keyof typeof colors, string, string][] = [
+      ["anime", "Anime", "#02a9ff"],
+      ["manga", "Manga", "#8b5cf6"],
+      ["staff", "Staff", "#4ade80"],
+      ["studios", "Studios", "#f59e0b"],
+      ["tags", "Tags", "#f87171"],
+      ["characters", "Characters", "#fbbf24"],
+    ];
+
+    containerEl.createEl("h3", { text: "Graph Colors" });
+    containerEl.createEl("p", {
+      text: "Customise the colours used for each note type in Obsidian's graph view.",
+      cls: "setting-item-description",
+    });
+
+    for (const [key, label, defaultColor] of labels) {
+      const currentColor = colors[key] || defaultColor;
+      new Setting(containerEl)
+        .setName(label)
+        .setDesc(`Graph node colour for ${label.toLowerCase()} notes`)
+        .addColorPicker((picker) =>
+          picker
+            .setValue(currentColor)
+            .onChange(async (value) => {
+              colors[key] = value;
+              await this.plugin.saveSettings();
+              this.plugin.applyGraphColors();
+            }),
+        )
+        .addButton((btn) =>
+          btn
+            .setButtonText("Reset")
+            .setTooltip(`Reset to ${defaultColor}`)
+            .onClick(async () => {
+              colors[key] = defaultColor;
+              await this.plugin.saveSettings();
+              this.plugin.applyGraphColors();
+              this.display();
+            }),
+        );
+    }
   }
 
   private renderActionsSection(containerEl: HTMLElement): void {
