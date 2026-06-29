@@ -98,7 +98,7 @@ export class ChatView extends ItemView {
     const text = username ? `Search anime, ${username}` : "Search anime";
 
     const msg = this.messagesEl.createDiv({ cls: "anisync-chat-welcome" });
-    msg.style.cssText = "text-align: center; padding: 180px 16px 32px; font-family: 'Anthropic Sans', sans-serif; font-size: 18px; color: var(--text-muted);";
+    msg.style.cssText = "text-align: center; padding: 180px 16px 32px; font-family: var(--font-interface); font-size: 18px; color: var(--text-muted);";
     msg.setText(text);
   }
 
