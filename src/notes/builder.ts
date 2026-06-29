@@ -424,12 +424,24 @@ export function buildArtifacts(built: BuiltArtifacts, syncedAt: string): NoteArt
   for (const p of built.staff.values()) artifacts.push(buildStaffArtifact(p, syncedAt));
   for (const t of built.tags.values()) artifacts.push(buildTagArtifact(t, syncedAt));
 
+  const mediaByCharId = new Map<number, { mediaId: number; mediaType: "ANIME" | "MANGA"; mediaTitle: string; role: string; vaNames: string[] }[]>();
+  const mediaByCharId = new Map<number, { mediaId: number; mediaType: "ANIME" | "MANGA"; mediaTitle: string; role: string; vaIds: number[] }[]>();
   const mediaByStudioId = new Map<number, string[]>();
 
   for (const m of built.media) {
     const mediaTitle = pickTitle(m.title);
     if (m.characters.length > 0) {
       artifacts.push(buildMediaCharacterArtifact(m, built.characters, syncedAt));
+    for (const c of m.characters) {
+      if (!mediaByCharId.has(c.id)) mediaByCharId.set(c.id, []);
+      mediaByCharId.get(c.id)!.push({
+        mediaId: m.mediaId,
+        mediaType: m.type,
+        mediaTitle,
+        role: c.role ?? "",
+        vaNames: c.voiceActors.map(va => va.name),
+        vaIds: c.voiceActors.map(va => va.id),
+      });
     }
     for (const studio of m.studios) {
       if (!mediaByStudioId.has(studio.id)) mediaByStudioId.set(studio.id, []);
@@ -439,6 +451,19 @@ export function buildArtifacts(built: BuiltArtifacts, syncedAt: string): NoteArt
     }
   }
 
+  for (const c of built.characters.values()) {
+    const refs = mediaByCharId.get(c.id) ?? [];
+    const charVAs = new Map<number, VoiceActorArtifactData>();
+    for (const ref of refs) {
+      for (const va of built.voiceActors.values()) {
+        if (!charVAs.has(va.id) && ref.vaNames.includes(va.name)) {
+          charVAs.set(va.id, va);
+        }
+      }
+    }
+    artifacts.push(buildCharacterArtifact(c, refs, [...charVAs.values()], syncedAt));
+    artifacts.push(buildCharacterArtifact(c, refs, built.voiceActors, syncedAt));
+  }
   for (const s of built.studios.values()) {
     const works = mediaByStudioId.get(s.id) ?? [];
     artifacts.push(buildStudioArtifact(s, works, syncedAt));
@@ -643,6 +668,15 @@ export function buildTagArtifact(tag: TagArtifactData, syncedAt: string): NoteAr
 export function buildMediaCharacterArtifact(
   mediaNote: MediaNote,
   characters: Map<number, CharacterArtifactData>,
+export function buildCharacterArtifact(
+  ch: CharacterArtifactData,
+  mediaRefs: { mediaId: number; mediaType: "ANIME" | "MANGA"; mediaTitle: string; role: string; vaNames: string[] }[],
+  voiceActors: VoiceActorArtifactData[],
+  syncedAt: string,
+): NoteArtifact {
+  const vaTags = voiceActors.map(va => `voiceactor/${slugify(va.name)}`);
+  mediaRefs: { mediaId: number; mediaType: "ANIME" | "MANGA"; mediaTitle: string; role: string; vaIds: number[] }[],
+  voiceActors: Map<number, VoiceActorArtifactData>,
   syncedAt: string,
 ): NoteArtifact {
   const title = pickTitle(mediaNote.title);
@@ -652,6 +686,16 @@ export function buildMediaCharacterArtifact(
     mediaId: mediaNote.mediaId,
     type: "MEDIA_CHARACTERS",
     mediaTitle: title,
+    anilistId: ch.id,
+    type: "CHARACTER",
+    name: ch.name,
+    nativeName: ch.native,
+    gender: ch.gender,
+    age: ch.age,
+    dateOfBirth: ch.dateOfBirth,
+    image: ch.imageLarge,
+    anilistUrl: ch.siteUrl,
+    tags: vaTags.length > 0 ? vaTags : undefined,
     syncedAt: SYNCED_AT_PLACEHOLDER,
   };
 
@@ -679,6 +723,29 @@ export function buildMediaCharacterArtifact(
 
     if (ch.voiceActors.length) {
       body.push("### Voice Actors");
+  const vaByLang = new Map<string, VoiceActorArtifactData[]>();
+  for (const va of voiceActors) {
+    const lang = va.language ?? "Unknown";
+    if (!vaByLang.has(lang)) vaByLang.set(lang, []);
+    vaByLang.get(lang)!.push(va);
+  }
+  if (vaByLang.size > 0) {
+    body.push("## Voice Actors");
+    body.push("");
+    for (const [lang, vas] of vaByLang) {
+      for (const va of vas) {
+        const mediaTitles = mediaRefs.filter(r => r.vaNames.includes(va.name)).map(r => r.mediaTitle);
+        const vaLine = va.imageLarge
+          ? `![photo](${va.imageLarge}) **${va.name}**`
+          : `**${va.name}**`;
+        const nativePart = va.native ? ` (${va.native})` : "";
+        const langPart = lang !== "Unknown" ? ` — ${lang}` : "";
+        const mediaPart = mediaTitles.length > 0 ? ` in ${mediaTitles.join(", ")}` : "";
+        body.push(`- ${vaLine}${nativePart}${langPart}${mediaPart}`);
+      }
+  if (vaList.length) {
+    for (const va of vaList) {
+      body.push(`## Voice Actor: ${va.name}`);
       body.push("");
       for (const va of ch.voiceActors) {
         if (va.imageLarge) {
