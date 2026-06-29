@@ -249,7 +249,6 @@ export default class AnisyncPlugin extends Plugin {
         studios: "Studios",
         tags: "Tags",
         characters: "Characters",
-        voiceActors: "Voice-Actors",
       };
       const colors = (this.settings.graphColors ?? {}) as unknown as Record<string, string>;
       for (const [key, folder] of Object.entries(folderMap)) {
