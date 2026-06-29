@@ -224,6 +224,49 @@ export default class AnisyncPlugin extends Plugin {
     this.settingTab?.display();
   }
 
+  invalidateChatContext(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)) {
+      const view = leaf.view as import("./chat/view").ChatView;
+      view.invalidateVaultContext();
+    }
+  }
+
+  async applyGraphColors(): Promise<void> {
+    try {
+      const path = ".obsidian/graph.json";
+      const adapter = this.app.vault.adapter;
+      const raw = await adapter.exists(path) ? await adapter.read(path) : '{"colorGroups":[]}';
+      const graph = JSON.parse(raw);
+      const outputDir = (this.settings.outputDir ?? "Ani-sync").replace(/^\/+|\/+$/g, "") || "Ani-sync";
+      const groups: Record<string, unknown>[] = graph.colorGroups ?? [];
+      const kept = groups.filter((g: Record<string, unknown>) => {
+        const q = (g.query as string ?? "").trim();
+        return !q.startsWith(`path:${outputDir}/`);
+      });
+      const folderMap: Record<string, string> = {
+        anime: "Anime",
+        manga: "Manga",
+        staff: "Staff",
+        studios: "Studios",
+        tags: "Tags",
+        characters: "Characters",
+      };
+      const colors = (this.settings.graphColors ?? {}) as unknown as Record<string, string>;
+      for (const [key, folder] of Object.entries(folderMap)) {
+        const hex = colors[key] ?? "#ffffff";
+        const rgb = parseInt(hex.replace("#", ""), 16);
+        kept.push({
+          query: `path:${outputDir}/${folder}`,
+          color: { rgb: isNaN(rgb) ? 16777215 : rgb, a: 1 },
+        });
+      }
+      graph.colorGroups = kept;
+      await adapter.write(path, JSON.stringify(graph, null, 2));
+    } catch (e) {
+      console.error("Ani-sync: failed to apply graph colors", e);
+    }
+  }
+
   async runSync(): Promise<void> {
     if (this.syncEngine) {
       new Notice("Ani-sync: sync already in progress.", 4000);
@@ -268,6 +311,8 @@ export default class AnisyncPlugin extends Plugin {
       this.settings.lastSyncAt = new Date().toISOString();
       this.settings.lastSyncStats = `${stats.created} created, ${stats.updated} updated, ${stats.skipped} unchanged, ${stats.failed} failed`;
       await this.saveAll();
+      try { await this.applyGraphColors(); } catch {}
+      this.invalidateChatContext();
       this.syncPopup.show("Sync complete!", 100);
       setTimeout(() => this.syncPopup.hide(), 2000);
       new Notice(`Ani-sync: done — ${stats.created} created, ${stats.updated} updated, ${stats.skipped} skipped, ${stats.failed} failed`, 6000);

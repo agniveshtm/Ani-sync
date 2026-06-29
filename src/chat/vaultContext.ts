@@ -1,9 +1,9 @@
 import { TFile } from "obsidian";
-import type { App } from "obsidian";
+import type { App, CachedMetadata } from "obsidian";
 
 export interface VaultNode {
   id: string;
-  type: "anime" | "manga" | "staff" | "studio" | "tag" | "profile" | "character" | "voiceactor";
+  type: "anime" | "manga" | "staff" | "studio" | "tag" | "profile" | "character";
   title: string;
   frontmatter: Record<string, unknown>;
   body: string;
@@ -19,7 +19,7 @@ export interface VaultSearchResult {
 const TYPE_MAP: Record<string, VaultNode["type"]> = {
   ANIME: "anime", MANGA: "manga", STAFF: "staff",
   STUDIO: "studio", TAG: "tag", PROFILE: "profile",
-  CHARACTER: "character", VOICE_ACTOR: "voiceactor",
+  CHARACTER: "character",
 };
 
 const TRIGRAM_SIZE = 3;
@@ -182,14 +182,35 @@ export class VaultContext {
     if (!folder) return;
 
     const files = this.getAllMarkdownFiles(folder);
+    const cache = this.app.metadataCache;
     for (const file of files) {
-      const node = await this.parseFile(file);
-      if (node) this.nodes.push(node);
+      const meta = cache.getFileCache(file);
+      const fm = meta?.frontmatter;
+      if (!fm?.anilistId) continue;
+
+      const type = fm.type;
+      if (typeof type !== "string") continue;
+      const normalizedType = TYPE_MAP[type] ?? type.toLowerCase() as VaultNode["type"];
+      const title = this.extractTitle(fm, meta?.headings);
+
+      this.nodes.push({
+        id: `${normalizedType}:${fm.anilistId}`,
+        type: normalizedType as VaultNode["type"],
+        title,
+        frontmatter: fm as Record<string, unknown>,
+        body: "",
+        path: file.path,
+      });
     }
     this.loaded = true;
 
     this.index = new SearchIndex();
     this.index.build(this.nodes);
+  }
+
+  invalidate(): void {
+    this.nodes = [];
+    this.loaded = false;
   }
 
   private getAllMarkdownFiles(folder: any): TFile[] {
@@ -271,12 +292,17 @@ export class VaultContext {
   }
 
   private extractTitle(fm: Record<string, unknown>, body: string): string {
+  private extractTitle(fm: Record<string, unknown>, headings?: { heading: string; level: number }[] | null): string {
     if (fm.title) {
       const t = fm.title as Record<string, unknown>;
       return (t.romaji as string) || (t.english as string) || (t.native as string) || String(fm.anilistId);
     }
-    const h1 = body.match(/^#\s+(.+)/m);
-    return h1 ? h1[1] : String(fm.anilistId);
+    if (headings) {
+      const h1 = headings.find(h => h.level === 1);
+      if (h1) return h1.heading;
+    }
+    const name = fm.name as string;
+    return name || String(fm.anilistId);
   }
 
   getLoadedCount(): number { return this.nodes.length; }
@@ -285,17 +311,170 @@ export class VaultContext {
   search(query: string): VaultSearchResult[] {
     if (!this.index) return [];
     return this.index.search(query);
+  private async loadNodeBody(node: VaultNode): Promise<void> {
+    if (node.body) return;
+    const file = this.app.vault.getAbstractFileByPath(node.path);
+    if (file instanceof TFile) {
+      node.body = await this.app.vault.cachedRead(file);
+    }
+  }
+
+  async search(query: string): Promise<VaultSearchResult[]> {
+    const q = query.toLowerCase().trim();
+    if (!q) return [];
+
+    const stopWords = new Set([
+      "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "as", "at",
+      "be", "because", "been", "before", "being", "below", "between", "both", "but", "by",
+      "did", "do", "does", "doing", "down", "during", "each", "few", "for", "from", "further",
+      "had", "has", "have", "having", "he", "her", "here", "hers", "him", "his", "how",
+      "i", "if", "in", "into", "is", "it", "its", "me", "more", "most", "my", "myself",
+      "no", "nor", "not", "of", "off", "on", "once", "only", "or", "other", "our", "ours", "ourselves", "out", "over", "own",
+      "same", "she", "should", "so", "some", "such", "than", "that", "the", "their", "theirs", "them", "themselves", "then", "there", "these", "they", "this", "those", "through", "to", "too", "under", "until", "up", "very", "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom", "why", "with", "you", "your", "yours", "yourself", "yourselves",
+      "name", "author", "creator", "writer", "artist", "illustrator", "score", "tell", "info", "information", "list", "show", "details", "find", "search", "give", "who is", "what is", "tell me"
+    ]);
+
+    const words = q.split(/[\s,.\-!?()]+/).filter(w => w.length >= 2 && !stopWords.has(w));
+    const keywords = words.length > 0 ? words : q.split(/\s+/).filter(Boolean);
+
+    const results: VaultSearchResult[] = [];
+    for (const node of this.nodes) {
+      let bestScore = 0;
+      let matchedField = "";
+
+      // 1. Direct whole-phrase matches (highest priority)
+      if (node.title.toLowerCase().includes(q)) {
+        bestScore = Math.max(bestScore, node.title.toLowerCase() === q ? 100 : 80);
+        matchedField = "title";
+      }
+
+      const fmName = node.frontmatter.name;
+      if (fmName && String(fmName).toLowerCase().includes(q)) {
+        bestScore = Math.max(bestScore, 90);
+        matchedField = "frontmatter:name";
+      }
+
+      if (node.frontmatter.nativeName && String(node.frontmatter.nativeName).toLowerCase().includes(q)) {
+        bestScore = Math.max(bestScore, 85);
+        matchedField = "nativeName";
+      }
+
+      const fmTitle = node.frontmatter.title;
+      if (fmTitle && typeof fmTitle === "object") {
+        const t = fmTitle as Record<string, unknown>;
+        for (const [, val] of Object.entries(t)) {
+          if (typeof val === "string" && val.toLowerCase().includes(q)) {
+            bestScore = Math.max(bestScore, 85);
+            matchedField = "frontmatter:title";
+          }
+        }
+      }
+
+      if (node.frontmatter.anilistId && String(node.frontmatter.anilistId) === q) {
+        bestScore = Math.max(bestScore, 100);
+        matchedField = "anilistId";
+      }
+
+      await this.loadNodeBody(node);
+      if (node.body.toLowerCase().includes(q)) {
+        bestScore = Math.max(bestScore, 30);
+        matchedField = matchedField || "body";
+      }
+
+      // 2. Keyword-based matching (for conversational queries with fuzzy scoring)
+      let keywordScore = 0;
+      let matchedKeywordsCount = 0;
+      const matchedFieldsList: string[] = [];
+
+      for (const word of keywords) {
+        let bestWordScore = 0;
+        let bestWordField = "";
+
+        const titleFuzzy = fuzzyScore(node.title, word);
+        if (titleFuzzy > bestWordScore) {
+          bestWordScore = titleFuzzy * 40;
+          bestWordField = "title";
+        }
+
+        if (fmName) {
+          const nameFuzzy = fuzzyScore(String(fmName), word);
+          if (nameFuzzy > bestWordScore) {
+            bestWordScore = nameFuzzy * 35;
+            bestWordField = "name";
+          }
+        }
+
+        if (node.frontmatter.nativeName) {
+          const nativeFuzzy = fuzzyScore(String(node.frontmatter.nativeName), word);
+          if (nativeFuzzy > bestWordScore) {
+            bestWordScore = nativeFuzzy * 30;
+            bestWordField = "nativeName";
+          }
+        }
+
+        if (fmTitle && typeof fmTitle === "object") {
+          const t = fmTitle as Record<string, unknown>;
+          for (const [, val] of Object.entries(t)) {
+            if (typeof val === "string") {
+              const valFuzzy = fuzzyScore(val, word);
+              if (valFuzzy > bestWordScore) {
+                bestWordScore = valFuzzy * 30;
+                bestWordField = "titleObj";
+              }
+            }
+          }
+        }
+
+        if (node.body.toLowerCase().includes(word)) {
+          if (10 > bestWordScore) {
+            bestWordScore = 10;
+            bestWordField = "body";
+          }
+        }
+
+        if (bestWordScore > 0) {
+          keywordScore += bestWordScore;
+          matchedKeywordsCount++;
+          matchedFieldsList.push(bestWordField);
+        }
+      }
+
+      if (keywords.length > 0 && matchedKeywordsCount > 0) {
+        const matchRatio = matchedKeywordsCount / keywords.length;
+        // Boost score based on keyword match ratio
+        const finalKeywordScore = keywordScore * matchRatio;
+        // Cap keyword score to 95 so exact full matches still take priority
+        bestScore = Math.max(bestScore, Math.min(95, finalKeywordScore));
+        if (matchedFieldsList.length > 0 && !matchedField) {
+          matchedField = `keywords(${Array.from(new Set(matchedFieldsList)).slice(0, 2).join(",")})`;
+        }
+      }
+
+      if (bestScore > 0) {
+        results.push({ node, score: bestScore, matchedField });
+      }
+    }
+
+    results.sort((a, b) => b.score - a.score);
+    return results.slice(0, 20);
   }
 
   getAllMedia(): VaultNode[] { return this.nodes.filter((n) => n.type === "anime" || n.type === "manga"); }
 
-  getStaffWorks(name: string): VaultNode[] {
+  async getStaffWorks(name: string): Promise<VaultNode[]> {
     const q = name.toLowerCase().trim();
     if (!q) return [];
     return this.nodes.filter((n) => n.body.toLowerCase().includes(q) && (n.type === "anime" || n.type === "manga"));
+    const results: VaultNode[] = [];
+    for (const n of this.nodes) {
+      if (n.type !== "anime" && n.type !== "manga") continue;
+      await this.loadNodeBody(n);
+      if (n.body.toLowerCase().includes(q)) results.push(n);
+    }
+    return results;
   }
 
-  buildPromptContext(results: VaultSearchResult[]): string {
+  async buildPromptContext(results: VaultSearchResult[]): Promise<string> {
     if (results.length === 0) return "No matching data found in your AniList library.";
     const parts = [
       "The following data is from the user's synced AniList library (vault). Answer ONLY from this information.",
@@ -316,6 +495,14 @@ export class VaultContext {
       if (n.frontmatter.language) lines.push(`  Language: ${n.frontmatter.language}`);
       if (n.frontmatter.tags && Array.isArray(n.frontmatter.tags)) lines.push(`  Tags: ${n.frontmatter.tags.join(", ")}`);
 
+      // Lazy-load body from vault if not cached
+      if (!n.body) {
+        const file = this.app.vault.getAbstractFileByPath(n.path);
+        if (file instanceof TFile) {
+          n.body = await this.app.vault.read(file);
+        }
+      }
+
       const bodyLines = n.body.split("\n");
       let inSection = "";
       for (const line of bodyLines) {
@@ -332,8 +519,8 @@ export class VaultContext {
 
   async buildContextForQuery(query: string): Promise<string> {
     await this.load();
-    const results = this.search(query);
-    return this.buildPromptContext(results);
+    const results = await this.search(query);
+    return await this.buildPromptContext(results);
   }
 }
 

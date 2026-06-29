@@ -291,6 +291,29 @@ export class AnisyncSettingTab extends PluginSettingTab {
             }),
         );
     }
+    for (const [key, label, _default] of labels) {
+      new Setting(containerEl)
+        .setName(label)
+        .addColorPicker((picker) =>
+          picker
+            .setValue(colors[key])
+            .onChange(async (value) => {
+              colors[key] = value;
+              await this.plugin.saveSettings();
+              await this.plugin.applyGraphColors();
+            }),
+        );
+    }
+
+    new Setting(containerEl)
+      .setName("Apply to graph now")
+      .setDesc("Update graph.json with the colours above.")
+      .addButton((btn) =>
+        btn.setButtonText("Apply").setCta().onClick(async () => {
+          await this.plugin.applyGraphColors();
+          new Notice("Graph colours applied. Reopen the graph panel to see changes.", 6000);
+        }),
+      );
   }
 
   private renderActionsSection(containerEl: HTMLElement): void {
