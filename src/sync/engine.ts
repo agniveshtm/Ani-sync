@@ -207,6 +207,9 @@ export class SyncEngine {
     onProgress(`Removing ${removed.length} obsolete note(s)...`, 92);
     await this.handleRemovals(removed, stats);
 
+    onProgress("Cleaning up legacy Voice-Actor files...", 94);
+    await this.cleanupVoiceActorArtifacts(stats);
+
     onProgress("Updating cache...", 95);
     await this.updateCache(newSummary, details);
 
@@ -357,6 +360,40 @@ export class SyncEngine {
 
     if (removed) this.onProgress?.(`  removed: ${removed}`);
     this.cache = { ...(this.cache ?? {}), noteHashes, paths: newPaths };
+  }
+
+  private async cleanupVoiceActorArtifacts(stats: SyncStats): Promise<void> {
+    const paths = this.cache?.paths ?? {};
+    const noteHashes = this.cache?.noteHashes ?? {};
+    const toDelete: { k: string; vaultPath: string }[] = [];
+
+    for (const [key, vaultPath] of Object.entries(paths)) {
+      if (key.startsWith("va:") && vaultPath.includes("/Voice-Actors/")) {
+        toDelete.push({ k: key, vaultPath });
+      }
+    }
+
+    if (toDelete.length === 0) return;
+
+    let removed = 0;
+    await pMapLimit(toDelete, DELETE_CONCURRENCY, async ({ k, vaultPath }) => {
+      if (this.cancelled) return;
+      try {
+        await this.vault.delete(vaultPath);
+        stats.updated += 1;
+        removed += 1;
+      } catch (e) {
+        if (/404/.test(String((e as Error)?.message))) {
+          removed += 1;
+        } else {
+          this.onLog?.(`  ! cleanup failed for ${vaultPath}: ${(e as Error)?.message ?? e}`);
+        }
+      }
+      delete noteHashes[k];
+      delete paths[k];
+    });
+
+    if (removed) this.onProgress?.(`  Voice-Actor clean-up: removed ${removed} file(s)`);
   }
 
   private async updateCache(

@@ -7,7 +7,6 @@ export interface GraphColors {
   studios: string;
   tags: string;
   characters: string;
-  voiceActors: string;
 }
 
 export interface AnisyncSettings {
@@ -31,7 +30,6 @@ export const DEFAULT_GRAPH_COLORS: GraphColors = {
   studios: "#f59e0b",
   tags: "#f87171",
   characters: "#fbbf24",
-  voiceActors: "#e879f9",
 };
 
 export const DEFAULT_SETTINGS: AnisyncSettings = {

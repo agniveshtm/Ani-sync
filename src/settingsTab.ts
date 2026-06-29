@@ -257,7 +257,6 @@ export class AnisyncSettingTab extends PluginSettingTab {
       ["studios", "Studios", "#f59e0b"],
       ["tags", "Tags", "#f87171"],
       ["characters", "Characters", "#fbbf24"],
-      ["voiceActors", "Voice Actors", "#e879f9"],
     ];
 
     containerEl.createEl("h3", { text: "Graph Colors" });
