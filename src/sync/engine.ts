@@ -168,7 +168,7 @@ export class SyncEngine {
       if (!m) return false;
       const chars = m.characters as { edges?: unknown[]; pageInfo?: { hasNextPage?: boolean } } | null | undefined;
       if (!chars?.edges) return false;
-      return chars.pageInfo?.hasNextPage || (chars.pageInfo === undefined && chars.edges.length >= 50);
+      return chars.pageInfo?.hasNextPage || (chars.pageInfo == null && chars.edges.length >= 50);
     });
     if (needsMoreChars.length > 0) {
       await pMapLimit(needsMoreChars, 4, async (m) => {
