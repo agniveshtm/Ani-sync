@@ -3,7 +3,7 @@ import type { App } from "obsidian";
 
 export interface VaultNode {
   id: string;
-  type: "anime" | "manga" | "staff" | "studio" | "tag" | "profile" | "character";
+  type: "anime" | "manga" | "staff" | "studio" | "tag" | "profile" | "character" | "media_characters" | "voice_actor_index";
   title: string;
   frontmatter: Record<string, unknown>;
   body: string;
@@ -19,7 +19,8 @@ export interface VaultSearchResult {
 const TYPE_MAP: Record<string, VaultNode["type"]> = {
   ANIME: "anime", MANGA: "manga", STAFF: "staff",
   STUDIO: "studio", TAG: "tag", PROFILE: "profile",
-  CHARACTER: "character",
+  CHARACTER: "character", MEDIA_CHARACTERS: "media_characters",
+  VOICE_ACTOR_INDEX: "voice_actor_index",
 };
 
 const TRIGRAM_SIZE = 3;
@@ -34,7 +35,27 @@ function buildTrigrams(text: string): Set<string> {
 }
 
 function tokenize(text: string): string[] {
-  return text.toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length > 0);
+  const tokens: string[] = [];
+  const lower = text.toLowerCase();
+  let i = 0;
+  while (i < lower.length) {
+    // CJK characters: split individually
+    const c = lower.charCodeAt(i);
+    if ((c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3040 && c <= 0x30FF) || (c >= 0xAC00 && c <= 0xD7AF)) {
+      tokens.push(lower[i]);
+      i++;
+      continue;
+    }
+    // Alphanumeric sequences
+    if (/[a-z0-9]/.test(lower[i])) {
+      let word = "";
+      while (i < lower.length && /[a-z0-9]/.test(lower[i])) { word += lower[i]; i++; }
+      if (word.length > 0) tokens.push(word);
+      continue;
+    }
+    i++;
+  }
+  return tokens;
 }
 
 function jaccard(a: Set<string>, b: Set<string>): number {
@@ -117,6 +138,11 @@ class SearchIndex {
 
     const queryTrigrams = buildTrigrams(q);
     const queryTokens = tokenize(q);
+
+    // Detect query intent: if user asks about voice/voiced/character, boost those types
+    const vaIntent = /voice|voiced|voiced by|speaks|language|va|seiyuu|japanese|caste|act(e|or|ress)/i.test(q);
+    const charIntent = /character|personagem|personaje|char/i.test(q);
+
     const scored: { entry: IndexEntry; score: number; matchedField: string }[] = [];
 
     for (const entry of this.entries) {
@@ -125,7 +151,8 @@ class SearchIndex {
 
       if (entry.node.title.toLowerCase() === q) { score = 100; matchedField = "title:exact"; }
       else if (entry.node.frontmatter.anilistId && String(entry.node.frontmatter.anilistId) === q) { score = 100; matchedField = "anilistId"; }
-      else if (entry.node.title.toLowerCase().includes(q)) { score = 80 + (q.length / entry.node.title.length) * 15; matchedField = "title:contains"; }
+      else if (entry.node.frontmatter.mediaId && String(entry.node.frontmatter.mediaId) === q) { score = 100; matchedField = "mediaId"; }
+      else if (entry.node.title.toLowerCase().includes(q)) { score = 80 + (q.length / (entry.node.title.length || 1)) * 15; matchedField = "title:contains"; }
       else if (entry.node.frontmatter.name && String(entry.node.frontmatter.name).toLowerCase().includes(q)) { score = 75; matchedField = "frontmatter:name"; }
       else if (entry.node.frontmatter.nativeName && String(entry.node.frontmatter.nativeName).toLowerCase().includes(q)) { score = 70; matchedField = "nativeName"; }
 
@@ -138,11 +165,14 @@ class SearchIndex {
 
       if (queryTokens.length > 0 && score < 70) {
         const bm25 = this.bm25Score(entry, queryTokens);
-        const norm = Math.min(60, bm25 * 10);
+        let norm = Math.min(65, bm25 * 12);
+        // Boost if query intent matches node type
+        if (vaIntent && (entry.node.type === "media_characters" || entry.node.type === "voice_actor_index")) norm += 15;
+        if (charIntent && entry.node.type === "media_characters") norm += 10;
         if (norm > score) { score = norm; matchedField = "bm25"; }
       }
 
-      if (score < 10 && q.length >= 3) {
+      if (score < 15 && q.length >= 3) {
         const fields = [
           { text: entry.node.title.toLowerCase(), w: 40, f: "title" },
           { text: String(entry.node.frontmatter.name ?? "").toLowerCase(), w: 35, f: "name" },
@@ -160,7 +190,7 @@ class SearchIndex {
     }
 
     scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, 20).map(s => ({ node: s.entry.node, score: s.score, matchedField: s.matchedField }));
+    return scored.slice(0, 30).map(s => ({ node: s.entry.node, score: s.score, matchedField: s.matchedField }));
   }
 }
 
@@ -220,11 +250,12 @@ export class VaultContext {
     try {
       const content = await this.app.vault.read(file);
       const { frontmatter, body } = this.parseFrontmatter(content);
-      if (!frontmatter?.anilistId) return null;
+      if (!frontmatter?.anilistId && !frontmatter?.mediaId) return null;
 
       const type = frontmatter.type as string;
       const normalizedType = TYPE_MAP[type] ?? type.toLowerCase() as VaultNode["type"];
-      const id = `${normalizedType}:${frontmatter.anilistId}`;
+      const entityId = frontmatter.anilistId ?? frontmatter.mediaId;
+      const id = `${normalizedType}:${entityId}`;
       const title = this.extractTitle(frontmatter, body);
 
       return { id, type: normalizedType as VaultNode["type"], title, frontmatter, body, path: file.path };
@@ -290,7 +321,7 @@ export class VaultContext {
       return (t.romaji as string) || (t.english as string) || (t.native as string) || String(fm.anilistId);
     }
     const h1 = body.match(/^#\s+(.+)/m);
-    return h1 ? h1[1] : String(fm.anilistId);
+    return h1 ? h1[1] : String(fm.anilistId ?? fm.mediaId ?? "unknown");
   }
 
   getLoadedCount(): number { return this.nodes.length; }
@@ -300,25 +331,29 @@ export class VaultContext {
     if (!this.index) return [];
     const results = this.index.search(query);
 
-    // If top results are low-scored, try multi-term intersection fallback
-    if (results.length === 0 || results[0].score < 30) {
+    // Multi-term fallback: when search gives low scores, find nodes containing ALL query terms
+    const needsFallback = results.length === 0 || results[0].score < 30;
+    if (needsFallback) {
       const tokens = query.toLowerCase().trim().split(/[\s,.\-!?()]+/).filter(t => t.length > 2);
-      if (tokens.length >= 2) {
-        const intersectResults: VaultSearchResult[] = [];
+      const jpTokens = [...query.toLowerCase()].filter(c => /[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(c));
+      const allTerms = [...tokens, ...jpTokens];
+      if (allTerms.length >= 2) {
+        const fallback: VaultSearchResult[] = [];
         for (const node of this.nodes) {
-          const allText = `${node.title} ${node.body}`.toLowerCase();
-          const matchCount = tokens.filter(t => allText.includes(t)).length;
-          if (matchCount === tokens.length) {
-            intersectResults.push({
+          const allText = `${node.title} ${node.frontmatter.name ?? ""} ${node.frontmatter.nativeName ?? ""} ${node.frontmatter.voiceActors ?? ""} ${node.body}`.toLowerCase();
+          const matchCount = allTerms.filter(t => allText.includes(t)).length;
+          const ratio = matchCount / allTerms.length;
+          if (ratio >= 0.5) {
+            fallback.push({
               node,
-              score: 50 + matchCount * 5,
-              matchedField: `multi:${tokens.join("+")}`,
+              score: Math.round(40 + ratio * 40),
+              matchedField: `multi:${allTerms.slice(0, 3).join("+")}${allTerms.length > 3 ? "..." : ""}`,
             });
           }
         }
-        if (intersectResults.length > 0) {
-          intersectResults.sort((a, b) => b.score - a.score);
-          return intersectResults.slice(0, 20);
+        if (fallback.length > 0) {
+          fallback.sort((a, b) => b.score - a.score);
+          return fallback.slice(0, 30);
         }
       }
     }
@@ -341,7 +376,7 @@ export class VaultContext {
       "---",
     ];
 
-    for (const r of results.slice(0, 10)) {
+    for (const r of results.slice(0, 15)) {
       const n = r.node;
       const lines: string[] = [];
       lines.push(`${n.type.toUpperCase()}: "${n.title}"`);
