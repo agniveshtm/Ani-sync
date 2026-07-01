@@ -479,7 +479,14 @@ export class VaultContext {
     const results = this.index.search(query);
 
     // Heading index: direct O(1) lookup for character names
-    const cleanQuery = query.replace(/who\s+(is|was|voices|voiced|plays|played|acts|acted|portrays|portrayed)\s*/gi, "").trim().toLowerCase();
+    const cleanQuery = query
+      .replace(/who\s+(is|was|voices|voiced|plays|played|acts|acted|portrays|portrayed)\s*/gi, "")
+      .replace(/va\s+(of|for)\s*/gi, "")
+      .replace(/voice\s+actor\s+(of|for)\s*/gi, "")
+      .replace(/who\s+(is|was|the)\s+/gi, "")
+      .replace(/what\s+(is|was)\s+/gi, "")
+      .trim()
+      .toLowerCase();
     if (cleanQuery.length >= 2) {
       const headingIds = this.index.findHeading(cleanQuery);
       if (headingIds.length > 0) {
