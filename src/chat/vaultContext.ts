@@ -590,13 +590,15 @@ export class VaultContext {
 
       // Block-level selection with budget awareness
       const blocks = this.index?.getBlocks(n.id) ?? [];
-      if (blocks.length > 0 && r.score < 95) {
+      if (blocks.length > 0) {
         const queryTokens = tokenize(r.matchedField.replace(/heading:|trigram:|bm25:|multi:|link:|title:|frontmatter:/g, ""));
         const queryTrigrams = buildTrigrams(queryTokens.join(" "));
         const scored = blocks.map(b => ({ block: b, score: this.index!.scoreBlock(b, queryTokens, queryTrigrams) }))
           .filter(b => b.score > 10 || b.block.heading.toLowerCase().includes(queryTokens.join(" ")))
           .sort((a, b) => b.score - a.score);
 
+        // Always include the top-scoring block (likely the match)
+        // Plus any blocks that contain the query terms
         for (const { block } of scored) {
           if (used >= BUDGET) break;
           const sectionHeader = `  [## ${block.heading}]`;
@@ -609,7 +611,7 @@ export class VaultContext {
           for (const line of blockLines) {
             const trimmed = line.trim();
             if (!trimmed || trimmed.startsWith("![") || trimmed.startsWith("|")) continue;
-            if (sectionLen >= 15000) break;
+            if (sectionLen >= 20000) break;
             const lineLen = trimmed.length + 2;
             if (used + lineLen >= BUDGET) break;
             used += lineLen;
