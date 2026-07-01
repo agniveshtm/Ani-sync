@@ -80,10 +80,13 @@ class SearchIndex {
   entries: IndexEntry[] = [];
   private df = new Map<string, number>();
   private totalDocs = 0;
+  // Heading index: lowercase heading → list of node ids
+  private headingIndex = new Map<string, string[]>();
 
   build(nodes: VaultNode[]): void {
     this.entries = [];
     this.df.clear();
+    this.headingIndex.clear();
     this.totalDocs = nodes.length;
 
     for (const node of nodes) {
@@ -103,12 +106,35 @@ class SearchIndex {
         this.df.set(token, (this.df.get(token) ?? 0) + 1);
       }
 
+      // Extract ## headings for heading index
+      const lines = node.body.split("\n");
+      for (const line of lines) {
+        if (line.startsWith("## ")) {
+          const heading = line.slice(3).trim().toLowerCase();
+          if (heading.length >= 2) {
+            if (!this.headingIndex.has(heading)) this.headingIndex.set(heading, []);
+            this.headingIndex.get(heading)!.push(node.id);
+          }
+        }
+      }
+
       this.entries.push({
         node, titleTrigrams, bodyTrigrams,
         titleTokens, bodyTokens, titleFreq, bodyFreq,
         totalTokens: bodyTokens.length,
       });
     }
+  }
+
+  findHeading(query: string): string[] {
+    const q = query.toLowerCase().trim();
+    // Exact heading match
+    if (this.headingIndex.has(q)) return this.headingIndex.get(q)!;
+    // Partial heading match (query is contained in heading)
+    for (const [heading, ids] of this.headingIndex) {
+      if (heading.includes(q) && q.length >= 3) return ids;
+    }
+    return [];
   }
 
   private idf(term: string): number {
@@ -333,23 +359,17 @@ export class VaultContext {
     if (!this.index) return [];
     const results = this.index.search(query);
 
-    // Direct heading match: find nodes where a ## heading contains the query words
+    // Heading index: direct O(1) lookup for character names
     const cleanQuery = query.replace(/who\s+(is|was|voices|voiced|plays|played|acts|acted|portrays|portrayed)\s*/gi, "").trim().toLowerCase();
     if (cleanQuery.length >= 2) {
-      const headingHits: VaultSearchResult[] = [];
-      for (const node of this.nodes) {
-        if (node.type !== "media_characters") continue;
-        const bodyLines = node.body.split("\n");
-        for (const line of bodyLines) {
-          if (line.startsWith("## ") && line.toLowerCase().includes(cleanQuery)) {
-            headingHits.push({ node, score: 95, matchedField: `heading:${line.slice(3).trim()}` });
-            break;
-          }
+      const headingIds = this.index.findHeading(cleanQuery);
+      if (headingIds.length > 0) {
+        const headingHits: VaultSearchResult[] = [];
+        for (const id of headingIds) {
+          const node = this.nodes.find(n => n.id === id);
+          if (node) headingHits.push({ node, score: 95, matchedField: `heading:${cleanQuery}` });
         }
-      }
-      if (headingHits.length > 0) {
-        headingHits.sort((a, b) => b.score - a.score);
-        return headingHits.slice(0, 20);
+        return headingHits;
       }
     }
 
