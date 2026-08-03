@@ -313,13 +313,27 @@ class VectorSearch {
 
     for (let i = 0; i < lower.length; i++) {
       const c = lower.charCodeAt(i);
-      // a-z or 0-9
-      if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) {
+      // CJK characters: split individually
+      if ((c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3040 && c <= 0x30FF) || (c >= 0xAC00 && c <= 0xD7AF)) {
+        // Flush current word
+        if (wordLen > 2 && !INDEX_STOP_WORDS.has(word)) {
+          result.push(word);
+        }
+        word = '';
+        wordLen = 0;
+        // Add CJK character as single token
+        result.push(lower[i]);
+        continue;
+      }
+      // a-z, 0-9, hyphens, underscores
+      if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 45 || c === 95) {
         word += lower[i];
         wordLen++;
       } else if (wordLen > 0) {
         // End of word
-        if (wordLen > 2 && !INDEX_STOP_WORDS.has(word)) {
+        // Trim trailing hyphens/underscores
+        word = word.replace(/[-_]+$/, "");
+        if (word.length > 2 && !INDEX_STOP_WORDS.has(word)) {
           result.push(word);
         }
         word = '';
@@ -328,8 +342,11 @@ class VectorSearch {
     }
 
     // Don't forget last word
-    if (wordLen > 2 && !INDEX_STOP_WORDS.has(word)) {
-      result.push(word);
+    if (wordLen > 0) {
+      word = word.replace(/[-_]+$/, "");
+      if (word.length > 2 && !INDEX_STOP_WORDS.has(word)) {
+        result.push(word);
+      }
     }
 
     return result;
@@ -1075,6 +1092,24 @@ class SearchIndex {
         const matched = s.entry.sections.find((section) => section.heading.toLowerCase() === matchedHeading!.toLowerCase());
         matchedSection = matched ? `## ${matched.heading}\n${matched.content}`.trim() : undefined;
       }
+      // For non-section matches, find the most relevant section from the query
+      if (!matchedSection && s.entry.sections.length > 0) {
+        const queryTokens = tokenize(q);
+        let bestSection: typeof s.entry.sections[0] | null = null;
+        let bestScore = 0;
+        for (const section of s.entry.sections) {
+          const sectionTokens = new Set(section.tokens);
+          const overlap = queryTokens.filter(t => sectionTokens.has(t)).length;
+          if (overlap > bestScore) {
+            bestScore = overlap;
+            bestSection = section;
+          }
+        }
+        if (bestSection && bestScore > 0) {
+          matchedHeading = bestSection.heading;
+          matchedSection = `## ${bestSection.heading}\n${bestSection.content}`.trim();
+        }
+      }
       return { node: s.entry.node, score: s.score, matchedField: s.matchedField, matchedHeading, matchedSection };
     });
   }
@@ -1494,29 +1529,30 @@ export class VaultContext {
 
     filteredResults.sort((a, b) => b.score - a.score);
 
-    // Multi-term fallback: when search gives low scores, find nodes containing ALL query terms
+    // Multi-term fallback: when search gives low scores, boost nodes containing query terms
     const needsFallback = filteredResults.length === 0 || filteredResults[0].score < 30;
     if (needsFallback) {
       const tokens = query.toLowerCase().trim().split(/[\s,.\-!?()]+/).filter(t => t.length > 2);
       const jpTokens = [...query.toLowerCase()].filter(c => /[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(c));
       const allTerms = [...tokens, ...jpTokens];
       if (allTerms.length >= 2) {
-        const fallback: VaultSearchResult[] = [];
+        const existingIds = new Set(filteredResults.map(r => r.node.id));
         for (const node of this.nodes) {
-          const allText = `${node.title} ${node.frontmatter.name ?? ""} ${node.frontmatter.nativeName ?? ""} ${node.frontmatter.voiceActors ?? ""} ${node.body}`.toLowerCase();
+          if (existingIds.has(node.id)) continue;
+          const allText = `${node.title} ${node.frontmatter.name ?? ""} ${node.frontmatter.nativeName ?? ""} ${Array.isArray(node.frontmatter.voiceActors) ? node.frontmatter.voiceActors.join(" ") : ""} ${node.body}`.toLowerCase();
           const matchCount = allTerms.filter(t => allText.includes(t)).length;
           const ratio = matchCount / allTerms.length;
           if (ratio >= 0.5) {
-            fallback.push({
+            filteredResults.push({
               node,
               score: Math.round(40 + ratio * 40),
               matchedField: `multi:${allTerms.slice(0, 3).join("+")}${allTerms.length > 3 ? "..." : ""}`,
             });
           }
         }
-        if (fallback.length > 0) {
-          fallback.sort((a, b) => b.score - a.score);
-          return fallback.slice(0, 20);
+        if (filteredResults.length > 0) {
+          filteredResults.sort((a, b) => b.score - a.score);
+          return filteredResults.slice(0, 20);
         }
       }
     }
@@ -1553,20 +1589,47 @@ export class VaultContext {
       const n = r.node;
       const lines: string[] = [];
       lines.push(`${n.type.toUpperCase()}: "${n.title}"`);
-      if (n.frontmatter.type) lines.push(`  Media Type: ${n.frontmatter.type}`);
-      if (n.frontmatter.format) lines.push(`  Format: ${n.frontmatter.format}`);
-      if (n.frontmatter.status) lines.push(`  Status: ${n.frontmatter.status}`);
-      if (n.frontmatter.score != null) lines.push(`  User Score: ${n.frontmatter.score}/10`);
-      if (n.frontmatter.averageScore != null) lines.push(`  Average Score: ${n.frontmatter.averageScore}/100`);
-      if (n.frontmatter.episodes != null) lines.push(`  Episodes: ${n.frontmatter.episodes}`);
-      if (n.frontmatter.chapters != null) lines.push(`  Chapters: ${n.frontmatter.chapters} | Volumes: ${n.frontmatter.volumes ?? "?"}`);
-      if (n.frontmatter.duration) lines.push(`  Duration: ${n.frontmatter.duration} min`);
-      if (n.frontmatter.genres) lines.push(`  Genres: ${Array.isArray(n.frontmatter.genres) ? n.frontmatter.genres.join(", ") : n.frontmatter.genres}`);
-      if (n.frontmatter.language) lines.push(`  Language: ${n.frontmatter.language}`);
-      if (n.frontmatter.animeTags && Array.isArray(n.frontmatter.animeTags)) lines.push(`  Tags: ${n.frontmatter.animeTags.join(", ")}`);
-      if (n.frontmatter.listName) lines.push(`  List: ${n.frontmatter.listName}`);
-      if (n.frontmatter.progress != null) lines.push(`  Progress: ${n.frontmatter.progress}`);
-      if (n.frontmatter.anilistUrl) lines.push(`  URL: ${n.frontmatter.anilistUrl}`);
+
+      // Core metadata
+      const fm = n.frontmatter;
+      if (fm.type) lines.push(`  Media Type: ${fm.type}`);
+      if (fm.format) lines.push(`  Format: ${fm.format}`);
+      if (fm.status) lines.push(`  Status: ${fm.status}`);
+      if (fm.score != null) lines.push(`  User Score: ${fm.score}/10`);
+      if (fm.averageScore != null) lines.push(`  Average Score: ${fm.averageScore}/100`);
+      if (fm.episodes != null) lines.push(`  Episodes: ${fm.episodes}`);
+      if (fm.chapters != null) lines.push(`  Chapters: ${fm.chapters} | Volumes: ${fm.volumes ?? "?"}`);
+      if (fm.duration) lines.push(`  Duration: ${fm.duration} min`);
+      if (fm.genres) lines.push(`  Genres: ${Array.isArray(fm.genres) ? fm.genres.join(", ") : fm.genres}`);
+      if (fm.language) lines.push(`  Language: ${fm.language}`);
+      if (fm.animeTags && Array.isArray(fm.animeTags)) lines.push(`  Tags: ${fm.animeTags.join(", ")}`);
+      if (fm.listName) lines.push(`  List: ${fm.listName}`);
+      if (fm.progress != null) lines.push(`  Progress: ${fm.progress}`);
+      if (fm.anilistUrl) lines.push(`  URL: ${fm.anilistUrl}`);
+      if (fm.name) lines.push(`  Name: ${fm.name}`);
+      if (fm.nativeName) lines.push(`  Native Name: ${fm.nativeName}`);
+      if (fm.startDate) lines.push(`  Start Date: ${fm.startDate}`);
+      if (fm.endDate) lines.push(`  End Date: ${fm.endDate}`);
+      if (fm.source) lines.push(`  Source: ${fm.source}`);
+      if (fm.country) lines.push(`  Country: ${fm.country}`);
+      if (fm.popularity != null) lines.push(`  Popularity: ${fm.popularity}`);
+      if (fm.favourites != null) lines.push(`  Favourites: ${fm.favourites}`);
+      if (fm.description) lines.push(`  Description: ${fm.description}`);
+      if (fm.synonyms && Array.isArray(fm.synonyms)) lines.push(`  Aliases: ${fm.synonyms.join(", ")}`);
+
+      // Relational data
+      if (Array.isArray(fm.characters) && fm.characters.length > 0) lines.push(`  Characters: ${fm.characters.join(", ")}`);
+      if (Array.isArray(fm.voiceActors) && fm.voiceActors.length > 0) lines.push(`  Voice Actors: ${fm.voiceActors.join(", ")}`);
+      if (Array.isArray(fm.studios) && fm.studios.length > 0) lines.push(`  Studios: ${fm.studios.join(", ")}`);
+      if (Array.isArray(fm.staff) && fm.staff.length > 0) lines.push(`  Staff: ${fm.staff.join(", ")}`);
+      if (fm.relations && Array.isArray(fm.relations)) lines.push(`  Relations: ${fm.relations.join(", ")}`);
+      if (fm.externalLinks && Array.isArray(fm.externalLinks)) lines.push(`  External Links: ${fm.externalLinks.join(", ")}`);
+      if (fm.streamingEpisodes && Array.isArray(fm.streamingEpisodes)) lines.push(`  Streaming Episodes: ${fm.streamingEpisodes.join(", ")}`);
+      if (fm.nextAiringEpisode) lines.push(`  Next Airing: ${JSON.stringify(fm.nextAiringEpisode)}`);
+
+      // IDs
+      if (fm.anilistId) lines.push(`  AniList ID: ${fm.anilistId}`);
+      if (fm.mediaId) lines.push(`  Media ID: ${fm.mediaId}`);
 
       // Use smart section extraction for better context
       const bodyLines = r.matchedSection
@@ -1574,7 +1637,7 @@ export class VaultContext {
         : this.extractRelevantSections(n.body, query);
       for (const line of bodyLines) {
         const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith("![") || trimmed.startsWith("|")) continue;
+        if (!trimmed || trimmed.startsWith("![") || trimmed.startsWith("```")) continue;
         lines.push(`  ${trimmed}`);
       }
 
@@ -1724,6 +1787,13 @@ export class VaultContext {
       sections.push({ start: currentStart, end: lines.length, score: 0, heading: currentHeading });
     }
 
+    // Include pre-heading content as a "preamble" section (lines before first ## heading)
+    if (sections.length > 0 && sections[0].start > 0) {
+      sections.unshift({ start: 0, end: sections[0].start, score: 0, heading: "preamble" });
+    } else if (sections.length === 0 && lines.length > 0) {
+      sections.push({ start: 0, end: lines.length, score: 0, heading: "full" });
+    }
+
     // Score each section based on query relevance
     for (const section of sections) {
       const sectionText = lines.slice(section.start, section.end).join(" ").toLowerCase();
@@ -1754,8 +1824,8 @@ export class VaultContext {
 
     // Collect lines from top sections
     const result: string[] = [];
-    const prelude = lines.slice(0, Math.min(lines.length, 10)).filter(line => 
-      line.startsWith("# ") || line.startsWith("**Status:**") || line.startsWith("**Score:**")
+    const prelude = lines.slice(0, Math.min(lines.length, 15)).filter(line =>
+      line.startsWith("# ") || line.startsWith("**") || line.startsWith("- ")
     );
     result.push(...prelude);
 
