@@ -108,7 +108,7 @@ export class AnisyncSettingTab extends PluginSettingTab {
     if (!s.anilistToken) {
       new Setting(section)
         .setName("Connect to AniList")
-        .setDesc("Opens AniList authorization page. After approving, connection is established automatically.")
+        .setDesc("Opens AniList authorization page. After approving, Obsidian may show a confirmation dialog - click Continue (and optionally check 'Don't ask again') to complete the connection.")
         .addButton((btn) =>
           btn
             .setButtonText("Connect to AniList")

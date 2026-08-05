@@ -75,6 +75,13 @@ h1 {
   color: var(--muted);
   margin: 0;
 }
+.hint + .hint {
+  margin-top: 6px;
+}
+.hint strong {
+  color: var(--fg);
+  font-weight: 600;
+}
 
 .loader {
   margin-top: 18px;
