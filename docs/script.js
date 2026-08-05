@@ -7,6 +7,11 @@
 //   3. User clicks Authorize. AniList redirects back here with
 //      #access_token=<JWT> in the URL fragment.
 //   4. We redirect to obsidian://ani-sync?token=TOKEN so Obsidian catches it.
+//
+//   NOTE (Obsidian July 30 desktop update): Obsidian now shows a
+//   confirmation dialog before firing URI actions. The user must click
+//   "Continue" (and optionally "Don't ask again") to complete the flow.
+//   This is a core Obsidian security feature and cannot be bypassed.
 
 const ANISYNC_CLIENT_ID = "44093";
 const ANILIST_AUTHORIZE_URL = "https://anilist.co/api/v2/oauth/authorize";

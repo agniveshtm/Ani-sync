@@ -17,6 +17,10 @@ export async function handleDeepLinkToken(plugin: AnisyncPlugin, token: string):
   plugin.settings.anilistToken = token;
   await plugin.saveAll();
 
+  // Obsidian (July 30 desktop update) now shows a confirmation dialog before
+  // firing URI actions. The user clicked "Continue" to reach this point.
+  // If they dismissed the dialog, the token won't arrive here. They will need
+  // to reconnect and click "Continue" (optionally "Don't ask again").
   new Notice("Verifying connection...", 3000);
   try {
     await probeAnilistConnection(plugin);
