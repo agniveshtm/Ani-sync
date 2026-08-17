@@ -22,8 +22,8 @@ export async function sha256Hex(text: string): Promise<string> {
   return out;
 }
 
-export async function appendHashMarker(body: string): Promise<string> {
+export async function appendHashMarker(body: string, hash?: string): Promise<string> {
   const trimmed = body.replace(/\s+$/g, "");
-  const hash = await sha256Hex(trimmed);
-  return `${trimmed}\n\n<!-- anilist-hash: ${hash} -->\n`;
+  const h = hash ?? (await sha256Hex(trimmed));
+  return `${trimmed}\n\n<!-- anilist-hash: ${h} -->\n`;
 }

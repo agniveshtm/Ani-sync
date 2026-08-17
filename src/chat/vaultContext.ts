@@ -141,7 +141,10 @@ function buildTrigrams(text: string): Set<string> {
 
 function tokenize(text: string): string[] {
   const tokens: string[] = [];
-  const lower = text.toLowerCase();
+  // Strip Latin combining diacritics so "Kaguya-sama wa Kokurasetai" style accents match ASCII
+  // queries. The trailing NFC recompose keeps kana intact (NFKD splits が into か + U+3099,
+  // which is outside the stripped range and would otherwise tokenize as two separate chars).
+  const lower = text.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").normalize("NFC").toLowerCase();
   let i = 0;
   while (i < lower.length) {
     // CJK characters: split individually
@@ -178,6 +181,7 @@ interface VectorEntry {
   terms: string[];        // Stored terms for fast lookup
   tfidf: number[];        // Parallel array of TF-IDF values
   norm: number;
+  termMap: Map<string, number>; // Prebuilt term → TF-IDF weight, so scoring allocates nothing
 }
 
 class VectorSearch {
@@ -206,7 +210,8 @@ class VectorSearch {
     const tempVectors: Array<{ id: string; tf: Map<string, number> }> = [];
 
     for (const node of this.nodes) {
-      const text = `${node.title} ${node.body}`;
+      // Include alternate titles so semantic recall works for romaji/english/native variants
+      const text = `${node.title} ${extractAliases(node).join(" ")} ${node.body}`;
       const terms = this.tokenize(text);
       const tf = new Map<string, number>();
 
@@ -233,6 +238,7 @@ class VectorSearch {
       const maxFreq = Math.max(...tf.values(), 1);
       const terms: string[] = [];
       const tfidf: number[] = [];
+      const termMap = new Map<string, number>();
       let normSq = 0;
 
       for (const [term, freq] of tf) {
@@ -242,10 +248,11 @@ class VectorSearch {
 
         terms.push(term);
         tfidf.push(score);
+        termMap.set(term, score);
         normSq += score * score;
       }
 
-      this.entries.push({ id, terms, tfidf, norm: Math.sqrt(normSq) });
+      this.entries.push({ id, terms, tfidf, norm: Math.sqrt(normSq), termMap });
     }
 
     this.built = true;
@@ -259,16 +266,14 @@ class VectorSearch {
     const queryVector = this.buildQueryVector(queryTerms);
     const results: Array<{ id: string; score: number }> = [];
 
-    // Convert query vector to parallel arrays for faster lookup
-    const qTerms: string[] = [];
-    const qValues: number[] = [];
-    for (const [term, score] of queryVector) {
-      qTerms.push(term);
-      qValues.push(score);
-    }
+    // Query norm is identical for every document — compute it once, not once per entry
+    let qNormSq = 0;
+    for (const value of queryVector.values()) qNormSq += value * value;
+    const qNorm = Math.sqrt(qNormSq);
+    if (qNorm === 0) return [];
 
     for (const entry of this.entries) {
-      const score = this.fastCosine(qTerms, qValues, entry);
+      const score = this.fastCosine(queryVector, qNorm, entry);
       if (score > 0.01) {
         results.push({ id: entry.id, score });
       }
@@ -279,27 +284,16 @@ class VectorSearch {
       .slice(0, topK);
   }
 
-  private fastCosine(qTerms: string[], qValues: number[], entry: VectorEntry): number {
+  private fastCosine(queryVector: Map<string, number>, qNorm: number, entry: VectorEntry): number {
+    if (entry.norm === 0) return 0;
+
+    // Probe the prebuilt document map with the (much smaller) query term set: no allocation here.
     let dotProduct = 0;
-    let qNormSq = 0;
-
-    // Build lookup map for entry terms
-    const entryMap = new Map<string, number>();
-    for (let i = 0; i < entry.terms.length; i++) {
-      entryMap.set(entry.terms[i], entry.tfidf[i]);
+    for (const [term, qValue] of queryVector) {
+      const docScore = entry.termMap.get(term);
+      if (docScore !== undefined) dotProduct += qValue * docScore;
     }
-
-    // Compute dot product and query norm
-    for (let i = 0; i < qTerms.length; i++) {
-      const docScore = entryMap.get(qTerms[i]);
-      if (docScore !== undefined) {
-        dotProduct += qValues[i] * docScore;
-      }
-      qNormSq += qValues[i] * qValues[i];
-    }
-
-    const qNorm = Math.sqrt(qNormSq);
-    if (qNorm === 0 || entry.norm === 0) return 0;
+    if (dotProduct === 0) return 0;
 
     return dotProduct / (qNorm * entry.norm);
   }
@@ -307,7 +301,8 @@ class VectorSearch {
   private tokenize(text: string): string[] {
     // Optimized tokenizer - single pass, no regex
     const result: string[] = [];
-    const lower = text.toLowerCase();
+    // Same diacritic folding as the module-level tokenize() so both indexes agree on terms.
+    const lower = text.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").normalize("NFC").toLowerCase();
     let word = '';
     let wordLen = 0;
 
@@ -449,12 +444,13 @@ function detectQueryMode(query: string): QueryMode {
 function parseConstraints(query: string): ParsedConstraints {
   const q = query.toLowerCase();
   const statuses: string[] = [];
-  if (/\bcompleted|finished\b/i.test(q)) statuses.push("completed");
-  if (/\bwatching|current|in progress\b/i.test(q)) statuses.push("current");
-  if (/\bplanned|plan to watch|plan to read\b/i.test(q)) statuses.push("planned");
+  // Each alternative needs its own \b pair — `/\ba|b\b/` only anchors the first/last branch.
+  if (/\b(?:completed|finished)\b/i.test(q)) statuses.push("completed");
+  if (/\b(?:watching|current(?:ly watching)?|in progress)\b/i.test(q)) statuses.push("current");
+  if (/\b(?:planned|plan to watch|plan to read)\b/i.test(q)) statuses.push("planned");
   if (/\bdropped\b/i.test(q)) statuses.push("dropped");
   if (/\bpaused\b/i.test(q)) statuses.push("paused");
-  if (/\brepeating|rewatching|rereading\b/i.test(q)) statuses.push("repeating");
+  if (/\b(?:repeating|rewatching|rereading)\b/i.test(q)) statuses.push("repeating");
 
   const collectAfter = (patterns: RegExp[]): string[] => {
     const out = new Set<string>();
@@ -639,10 +635,26 @@ class SearchIndex {
       const titleStr = `${node.title} ${node.frontmatter.name ?? ""} ${node.frontmatter.nativeName ?? ""}`;
       const titleTokens = tokenize(titleStr);
       const bodyTokens = tokenize(node.body);
+      const aliases = extractAliases(node);
+      const aliasTokens = aliases.map((alias) => tokenize(alias));
+
+      // Alternate titles (frontmatter.title.romaji/english/native, mediaTitle) are otherwise
+      // invisible to BM25, so fold their tokens into titleFreq. Tokens already present in
+      // titleStr are skipped so existing title term weights — and existing ranking — don't shift.
+      const aliasSeen = new Set(titleTokens);
+      const aliasOnlyTokens: string[] = [];
+      for (const tokens of aliasTokens) {
+        for (const t of tokens) {
+          if (aliasSeen.has(t) || INDEX_STOP_WORDS.has(t)) continue;
+          aliasSeen.add(t);
+          aliasOnlyTokens.push(t);
+        }
+      }
 
       const titleFreq = new Map<string, number>();
       const bodyFreq = new Map<string, number>();
       for (const t of titleTokens) titleFreq.set(t, (titleFreq.get(t) ?? 0) + 1);
+      for (const t of aliasOnlyTokens) titleFreq.set(t, (titleFreq.get(t) ?? 0) + 1);
       for (const t of bodyTokens) {
         if (!INDEX_STOP_WORDS.has(t)) {
           bodyFreq.set(t, (bodyFreq.get(t) ?? 0) + 1);
@@ -651,11 +663,10 @@ class SearchIndex {
 
       const titleTrigrams = buildTrigrams(titleStr);
       const bodyTrigrams = buildTrigrams(node.body);
-      const aliases = extractAliases(node);
-      const aliasTokens = aliases.map((alias) => tokenize(alias));
 
-      // Only count non-stop-word tokens for IDF
-      const allTokens = new Set([...titleTokens, ...bodyTokens.filter(t => !INDEX_STOP_WORDS.has(t))]);
+      // Only count non-stop-word tokens for IDF. Alias tokens must be counted too, otherwise
+      // bm25Score() sees df === 0 for them and skips the term entirely.
+      const allTokens = new Set([...titleTokens, ...aliasOnlyTokens, ...bodyTokens.filter(t => !INDEX_STOP_WORDS.has(t))]);
       for (const token of allTokens) {
         tokenDocCount.set(token, (tokenDocCount.get(token) ?? 0) + 1);
       }
@@ -880,9 +891,19 @@ class SearchIndex {
     const entityCandidates = extractEntityCandidates(query);
 
     // Detect query intent: if user asks about voice/voiced/character, boost those types
-    const vaIntent = /voice|voiced|voiced by|speaks|language|va|seiyuu|japanese|caste|act(e|or|ress)/i.test(q);
+    const vaIntent = /voice|voiced|voiced by|speaks|language|\bva\b|seiyuu|japanese|cast|act(e|or|ress)/i.test(q);
     const charIntent = /character|personagem|personaje|char/i.test(q);
     const whoIntent = /who\s+(is|was|voices|voiced|plays|played|acts|acted|portrays|portrayed)/i.test(q);
+
+    // Vector search is a per-query ranking pass, not a per-entry one: run it once and index by id.
+    const vectorResults = this.vectorSearch.search(expandedQuery, 20);
+    const vectorScoreById = new Map<string, number>(
+      vectorResults.map((r) => [r.id, r.score] as [string, number]),
+    );
+
+    // Significant query tokens, hoisted so the alias pass below doesn't re-tokenize per entry
+    const querySigTokens = tokenize(q).filter(t => isMeaningfulToken(t) && !QUERY_STOP_WORDS.has(t) && !TYPE_WORDS.has(t));
+    const querySigSet = new Set(querySigTokens);
 
     const scored: { entry: IndexEntry; score: number; matchedField: string }[] = [];
 
@@ -917,6 +938,27 @@ class SearchIndex {
         if (titleBase > score) {
           score = titleBase;
           matchedField = exactEntity ? "title:canonical" : "synonym:title";
+        }
+      }
+
+      // Same sig-token coverage test against alternate titles, so a query in romaji/english/native
+      // reaches the note even when it does not match node.title (the display title).
+      if (score < 92 && querySigTokens.length > 0) {
+        for (let i = 0; i < entry.aliasTokens.length; i++) {
+          const aliasSig = entry.aliasTokens[i].filter(t => isMeaningfulToken(t) && !QUERY_STOP_WORDS.has(t));
+          if (aliasSig.length === 0) continue;
+          const aliasSet = new Set(aliasSig);
+          const exactAlias =
+            [...aliasSet].every(t => querySigSet.has(t)) &&
+            [...querySigSet].every(t => aliasSet.has(t));
+          const partialAlias = exactAlias || querySigTokens.some(t => aliasSet.has(t));
+          let aliasBase = 0;
+          if (exactAlias) aliasBase = 92;
+          else if (partialAlias) aliasBase = 64;
+          if (aliasBase > score) {
+            score = aliasBase;
+            matchedField = exactAlias ? "alias:canonical" : "synonym:alias";
+          }
         }
       }
 
@@ -1029,16 +1071,14 @@ class SearchIndex {
         if (norm > score) { score = norm; matchedField = "bm25"; }
       }
 
-      // Vector search for semantic similarity (use expanded query with synonyms)
-      if (score < 60) {
-        const vectorResults = this.vectorSearch.search(expandedQuery, 5);
-        const vectorMatch = vectorResults.find(r => r.id === entry.node.id);
-        if (vectorMatch) {
-          const vectorScore = Math.min(70, vectorMatch.score * 100);
-          if (vectorScore > score) {
-            score = vectorScore;
-            matchedField = "vector:semantic";
-          }
+      // Vector search for semantic similarity (use expanded query with synonyms).
+      // Ungated so semantic similarity is a real ranking signal, not just a last-resort fallback.
+      const vScore = vectorScoreById.get(entry.node.id);
+      if (vScore !== undefined) {
+        const vectorScore = Math.min(95, vScore * 100);
+        if (vectorScore > score) {
+          score = vectorScore;
+          matchedField = "vector:semantic";
         }
       }
 
@@ -1213,11 +1253,8 @@ export class VaultContext {
         if (generation !== this.loadGeneration) return;
         this.nodes = newNodes;
 
-        // Update file hashes
-        for (const file of files) {
-          const content = await this.app.vault.read(file);
-          this.fileHashes.set(file.path, this.simpleHash(content));
-        }
+        // File hashes were recorded by parseFile() from the content it already read —
+        // no second read pass over every file.
 
         // Save to disk cache (only if we have nodes)
         if (this.nodes.length > 0) {
@@ -1304,6 +1341,9 @@ export class VaultContext {
   private async parseFile(file: TFile): Promise<VaultNode | null> {
     try {
       const content = await this.app.vault.read(file);
+      // Hash from the content we just read, so cold load reads each file exactly once.
+      // Recorded for every markdown file, including ones that are skipped below.
+      this.fileHashes.set(file.path, this.simpleHash(content));
       const { frontmatter, body } = this.parseFrontmatter(content);
       const mediaIds = Array.isArray(frontmatter?.mediaIds) ? frontmatter.mediaIds : [];
       const hasEntityId = frontmatter?.anilistId != null || frontmatter?.mediaId != null || mediaIds.length > 0;
@@ -1343,9 +1383,6 @@ export class VaultContext {
     return h1 ? h1[1] : String(fm.anilistId ?? fm.mediaId ?? "unknown");
   }
 
-  getLoadedCount(): number { return this.nodes.length; }
-  getLoadedTitles(): string[] { return this.nodes.map((n) => n.title).sort(); }
-
   search(query: string): VaultSearchResult[] {
     if (!this.index) return [];
     const results = this.index.search(query);
@@ -1363,11 +1400,12 @@ export class VaultContext {
         const candidateTokens = tokenize(candidate);
         if (candidateTokens.length === 0) continue;
 
-        for (const node of this.nodes) {
-          const sections = node.body.split("\n").filter((line) => line.startsWith("## "));
-          for (const section of sections) {
-            const heading = section.slice(3).trim();
-            const headingTokens = tokenize(heading);
+        // Reuse the headings/headingTokens already built by the index instead of re-splitting
+        // and re-tokenizing every note body on every query.
+        for (const entry of this.index.entries) {
+          for (let i = 0; i < entry.headings.length; i++) {
+            const heading = entry.headings[i];
+            const headingTokens = entry.headingTokens[i];
             const overlap = candidateTokens.filter((token) => headingTokens.includes(token)).length;
             if (overlap === 0) continue;
 
@@ -1375,9 +1413,9 @@ export class VaultContext {
             const coverage = overlap / candidateTokens.length;
             const compactness = overlap / Math.max(1, headingTokens.length);
             const score = (exact ? 99 : 82) + coverage * 10 + compactness * 4;
-            const prev = headingScores.get(node.id);
+            const prev = headingScores.get(entry.node.id);
             if (!prev || score > prev.score) {
-              headingScores.set(node.id, { score, heading, field: exact ? `heading:exact:${candidate}` : `heading:entity:${candidate}` });
+              headingScores.set(entry.node.id, { score, heading, field: exact ? `heading:exact:${candidate}` : `heading:entity:${candidate}` });
             }
           }
         }
@@ -1562,12 +1600,6 @@ export class VaultContext {
 
   getAllMedia(): VaultNode[] { return this.nodes.filter((n) => n.type === "anime" || n.type === "manga"); }
 
-  getStaffWorks(name: string): VaultNode[] {
-    const q = name.toLowerCase().trim();
-    if (!q) return [];
-    return this.nodes.filter((n) => n.body.toLowerCase().includes(q) && (n.type === "anime" || n.type === "manga"));
-  }
-
   buildPromptContext(results: VaultSearchResult[], mode: QueryMode = "entity", query: string = ""): string {
     if (results.length === 0) return "No matching data found in your AniList library.";
 
@@ -1698,68 +1730,6 @@ export class VaultContext {
 
     reportResults.sort((a, b) => b.score - a.score);
     return reportResults.slice(0, 15);
-  }
-
-  private extractRelevantBodyLines(body: string, matchedHeading?: string, matchedSection?: string, mode: QueryMode = "entity"): string[] {
-    const lines = body.split("\n");
-    if (mode === "report") {
-      return lines.filter((line) => {
-        const trimmed = line.trim();
-        if (!trimmed) return false;
-        return trimmed.startsWith("#")
-          || trimmed.startsWith("**Status:**")
-          || trimmed.startsWith("**Score:**")
-          || trimmed.startsWith("**Progress:**")
-          || trimmed.startsWith("## Synopsis")
-          || trimmed.startsWith("## Genres")
-          || trimmed.startsWith("## Tags")
-          || trimmed.startsWith("## Studios")
-          || trimmed.startsWith("## Staff")
-          || trimmed.startsWith("- ");
-      }).slice(0, 80);
-    }
-
-    if (mode === "summary" && !matchedSection && !matchedHeading) {
-      return lines.filter((line) => {
-        const trimmed = line.trim();
-        return trimmed.startsWith("#")
-          || trimmed.startsWith("**Status:**")
-          || trimmed.startsWith("**Score:**")
-          || trimmed.startsWith("**Progress:**")
-          || trimmed.startsWith("## ")
-          || trimmed.startsWith("- ");
-      }).slice(0, 50);
-    }
-
-    if (matchedSection) {
-      const prelude = lines.slice(0, Math.min(lines.length, 10)).filter((line) => line.startsWith("# ") || line.startsWith("**Status:**") || line.startsWith("**Score:**"));
-      return [...prelude, "", ...matchedSection.split("\n")];
-    }
-    if (!matchedHeading) return lines;
-
-    const normalizedHeading = matchedHeading.toLowerCase().trim();
-    let start = -1;
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (line.startsWith("## ") && line.slice(3).trim().toLowerCase().includes(normalizedHeading)) {
-        start = i;
-        break;
-      }
-    }
-
-    if (start === -1) return lines;
-
-    let end = lines.length;
-    for (let i = start + 1; i < lines.length; i++) {
-      if (lines[i].startsWith("## ")) {
-        end = i;
-        break;
-      }
-    }
-
-    // Include prelude (title, status, score) + matched section
-    const prelude = lines.slice(0, Math.min(lines.length, 10)).filter((line) => line.startsWith("# ") || line.startsWith("**Status:**") || line.startsWith("**Score:**"));
-    return [...prelude, "", ...lines.slice(start, end)];
   }
 
   // Extract sections that are most relevant to the query

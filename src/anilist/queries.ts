@@ -1,10 +1,3 @@
-import type {
-  MediaDetail,
-  MediaList,
-  MediaListCollection,
-  Viewer,
-} from "../types";
-
 export const VIEWER_QUERY = `
   query Viewer {
     Viewer {
@@ -190,14 +183,6 @@ export const SUMMARY_QUERY = `
   }
 `;
 
-export type ViewerResponse = { Viewer: Viewer };
-export type MediaListCollectionResponse = { MediaListCollection: MediaListCollection };
-export type MediaDetailResponse = { Media: MediaDetail };
-export type MediaDetailsBatchResponse = {
-  Page: { pageInfo: { hasNextPage: boolean }; media: MediaDetail[] };
-};
-export type SummaryResponse = { MediaListCollection: MediaListCollection };
-
 export type SummaryEntry = { id: number; updatedAt: number | null; media: { id: number; type: "ANIME" | "MANGA" } };
 export type SummaryList = { entries: SummaryEntry[] };
 export type SummaryCollection = { lists?: SummaryList[] | null };
@@ -213,26 +198,4 @@ export function flattenSummaryToMap(...collections: SummaryCollection[]): Record
     }
   }
   return out;
-}
-
-export function collectUniqueMediaFromFull(
-  ...listGroups: { lists?: MediaList[] | null }[]
-): { id: number; type: "ANIME" | "MANGA"; title: string }[] {
-  const seen = new Map<string, { id: number; type: "ANIME" | "MANGA"; title: string }>();
-  for (const col of listGroups) {
-    for (const list of col.lists ?? []) {
-      for (const e of list.entries) {
-        const k = `${e.media.type}:${e.media.id}`;
-        if (!seen.has(k)) {
-          const t = e.media.title;
-          seen.set(k, {
-            id: e.media.id,
-            type: e.media.type,
-            title: t?.userPreferred ?? t?.english ?? t?.romaji ?? String(e.media.id),
-          });
-        }
-      }
-    }
-  }
-  return [...seen.values()];
 }
