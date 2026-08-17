@@ -6,7 +6,7 @@ import {
 import type { AnilistCharacterConnection, AnilistCharacterEdge, AnilistVoiceActor, MediaDetail, MediaList } from "../types";
 import { buildAll, buildArtifacts, buildStudioArtifact, SYNCED_AT_PLACEHOLDER } from "../notes/builder";
 import { pickTitle } from "../notes/slugify";
-import { extractHashMarker, stripHashMarker, sha256Hex } from "./hash";
+import { extractHashMarker, stripHashMarker, sha256Hex, appendHashMarker } from "./hash";
 import { AnisyncCache, diffSummary } from "./cache";
 
 export interface VaultAdapter {
@@ -104,7 +104,8 @@ export class SyncEngine {
       onProgress("No changes detected. Cache-only update, skipping list fetches and writes.", 100);
       this.onLog?.("No changes detected - sync complete (cache-only update)");
       const idleStats: SyncStats = { created: 0, updated: 0, deleted: 0, skipped: unchanged.length, failed: 0, planned: 0 };
-      await this.updateCache(newSummary, cachedDetails);
+      // Idle auto-sync: nothing (summary or character freshness) changed, so the
+      // cache is already authoritative — skip the full cache rewrite/save.
       return idleStats;
     }
 
@@ -161,11 +162,15 @@ export class SyncEngine {
     }
 
     const fetchKeys = [...new Set([...changed, ...staleCharacterDetails])];
+    // Only fetch a list collection when the changed/incomplete keys actually
+    // include that media type — avoids an unnecessary ANIME/MANGA round-trip.
+    const fetchAnime = fetchKeys.some((k) => k.startsWith("ANIME:"));
+    const fetchManga = fetchKeys.some((k) => k.startsWith("MANGA:"));
     onProgress(`Fetching full lists for ${fetchKeys.length} changed/incomplete entry/entries...`, 7);
     this.onLog?.(`Fetching full lists for ${fetchKeys.length} changed/incomplete entries`);
     const [fullAnimeLists, fullMangaLists] = await Promise.all([
-      this.anilist.fetchFullList("ANIME", this.username),
-      this.anilist.fetchFullList("MANGA", this.username),
+      fetchAnime ? this.anilist.fetchFullList("ANIME", this.username) : Promise.resolve([] as MediaList[]),
+      fetchManga ? this.anilist.fetchFullList("MANGA", this.username) : Promise.resolve([] as MediaList[]),
     ]);
     const animeCount = countEntries(fullAnimeLists);
     const mangaCount = countEntries(fullMangaLists);
@@ -218,26 +223,33 @@ export class SyncEngine {
     for (const m of fetchedAnime) if (m) freshlyFetchedKeys.add(`ANIME:${m.id}`);
     for (const m of fetchedManga) if (m) freshlyFetchedKeys.add(`MANGA:${m.id}`);
 
-    const detailsNeedingCharacters = [...details.entries()].filter(([key, m]) => {
-      // Always re-fetch characters for freshly fetched media (batch query may have truncated them)
-      if (freshlyFetchedKeys.has(key)) return true;
-      // For cached entries, only re-fetch if the character list looks incomplete
+    const detailsNeedingCharacters = [...details.entries()].filter(([, m]) => {
+      // Trust the batch query's pageInfo: for freshly fetched media the batch
+      // result (characters perPage:50) is kept when it is complete; only re-fetch
+      // when needsCharacterRefresh says the list is incomplete. Cached entries
+      // re-fetch only when their stored character list looks incomplete.
       return this.needsCharacterRefresh(m);
     }).map(([, m]) => m);
 
     if (detailsNeedingCharacters.length > 0) {
-      this.onLog?.(`  character fetch needed for ${detailsNeedingCharacters.length} media entries (${freshlyFetchedKeys.size} freshly fetched, ${detailsNeedingCharacters.length - freshlyFetchedKeys.size} cache refresh)`);
+      const freshCount = detailsNeedingCharacters.filter((m) => freshlyFetchedKeys.has(`${m.type}:${m.id}`)).length;
+      this.onLog?.(`  character fetch needed for ${detailsNeedingCharacters.length} media entries (${freshCount} freshly fetched, ${detailsNeedingCharacters.length - freshCount} cache refresh)`);
       for (const m of detailsNeedingCharacters) {
         const existing = m.characters?.edges?.length ?? 0;
         this.onLog?.(`    -> ${m.type}:${m.id} ("${m.title?.userPreferred ?? m.title?.romaji ?? "?"}") [${existing} existing chars]`);
       }
       await pMapLimit(detailsNeedingCharacters, 4, async (m) => {
         if (this.cancelled) return;
+        const isFresh = freshlyFetchedKeys.has(`${m.type}:${m.id}`);
         try {
-          const fetchedEdges = await this.anilist.fetchAllCharacters(m.id, m.type, 1);
-          this.onLog?.(`  ${m.type}:${m.id}: fetched ${fetchedEdges.length} characters total`);
+          // Fresh media already has page-1 edges from the batch query, so start at
+          // page 2 and merge into the existing edges rather than overwriting them.
+          const startPage = isFresh ? 2 : 1;
+          const fetchedEdges = await this.anilist.fetchAllCharacters(m.id, m.type, startPage);
+          const existingEdges = isFresh ? (m.characters?.edges ?? []) : [];
+          this.onLog?.(`  ${m.type}:${m.id}: fetched ${fetchedEdges.length} characters (startPage ${startPage})`);
           m.characters = {
-            edges: fetchedEdges,
+            edges: [...existingEdges, ...fetchedEdges],
             pageInfo: { hasNextPage: false },
           };
         } catch (err) {
@@ -470,7 +482,10 @@ export class SyncEngine {
         continue;
       }
 
-      const bodyForHash = stripHashMarker(a.body.split(SYNCED_AT_PLACEHOLDER).join(this.syncedAt));
+      // Hash from the body with the syncedAt placeholder INTACT so a fresh
+      // timestamp alone never defeats the "skip if unchanged" check. The real
+      // timestamp is substituted into the body only at write time.
+      const bodyForHash = stripHashMarker(a.body);
       needsHash.push({ a, bodyForHash, idx: i });
     }
 
@@ -534,6 +549,9 @@ export class SyncEngine {
       const a = p.artifact;
       const { noteHash, bodyForHash } = p;
       const cachedHash = noteHashes[a.uniqueKey];
+      // Substitute the real timestamp into the placeholder-intact body only here,
+      // at write time. The stored hash is over the placeholder-intact body.
+      const writeBody = bodyForHash.split(SYNCED_AT_PLACEHOLDER).join(this.syncedAt);
 
       try {
         if (cachedHash === noteHash) {
@@ -544,7 +562,7 @@ export class SyncEngine {
         }
 
         if (cachedHash == null) {
-          const finalContent = `${bodyForHash.replace(/\s+$/g, "")}\n\n<!-- anilist-hash: ${noteHash} -->\n`;
+          const finalContent = await appendHashMarker(writeBody, noteHash);
           await this.vault.write(vaultPath, finalContent);
           stats.created += 1;
           noteHashes[a.uniqueKey] = noteHash;
@@ -560,7 +578,7 @@ export class SyncEngine {
           return;
         }
 
-        const finalContent = `${bodyForHash.replace(/\s+$/g, "")}\n\n<!-- anilist-hash: ${noteHash} -->\n`;
+        const finalContent = await appendHashMarker(writeBody, noteHash);
         await this.vault.write(vaultPath, finalContent);
         stats[existing == null ? "created" : "updated"] += 1;
         noteHashes[a.uniqueKey] = noteHash;
@@ -678,8 +696,9 @@ export class SyncEngine {
       );
 
       try {
-        // Compute new hash
-        const bodyForHash = stripHashMarker(artifact.body.split(SYNCED_AT_PLACEHOLDER).join(this.syncedAt));
+        // Compute new hash from the body with the syncedAt placeholder intact, so a
+        // fresh timestamp alone never defeats the "skip if unchanged" check.
+        const bodyForHash = stripHashMarker(artifact.body);
         const noteHash = await sha256Hex(bodyForHash);
         const cachedHash = noteHashes[uniqueKey];
 
@@ -691,8 +710,11 @@ export class SyncEngine {
         // Determine vault path
         const vaultPath = normalizePath(`${this.outputDir}/${artifact.folder}/${artifact.filename}`);
 
-        // Write the updated artifact
-        const finalContent = `${bodyForHash.replace(/\s+$/g, "")}\n\n<!-- anilist-hash: ${noteHash} -->\n`;
+        // Substitute the real timestamp at write time and append the hash marker.
+        const finalContent = await appendHashMarker(
+          bodyForHash.split(SYNCED_AT_PLACEHOLDER).join(this.syncedAt),
+          noteHash,
+        );
         await this.vault.write(vaultPath, finalContent);
         stats.updated += 1;
         noteHashes[uniqueKey] = noteHash;
@@ -769,14 +791,6 @@ export class SyncEngine {
     this.cache = { ...this.cache, noteHashes, paths };
   }
 
-  private cacheCharacterPages(mediaId: number, type: string, hasCharacters: boolean): void {
-    if (!this.cache.characterPages) {
-      this.cache.characterPages = {};
-    }
-    const key = `${type}:${mediaId}`;
-    this.cache.characterPages[key] = hasCharacters;
-  }
-
   private async updateCache(
     newSummary: Record<string, number>,
     detailsMap: Map<string, MediaDetail>,
@@ -787,7 +801,6 @@ export class SyncEngine {
       details: Object.fromEntries(detailsMap),
       noteHashes: this.cache?.noteHashes ?? {},
       paths: this.cache?.paths ?? {},
-      characterPages: this.cache?.characterPages ?? {},
     };
     await this.cacheStore.save(newCache);
     this.cache = newCache;

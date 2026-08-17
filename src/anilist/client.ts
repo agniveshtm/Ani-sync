@@ -17,6 +17,7 @@ const MODERATE_INTERVAL_MS = 700;
 const SLOW_INTERVAL_MS = 1500;
 const BATCH_PAGE_SIZE = 50;
 const BATCH_PAGE_SAFETY_CAP = 50;
+const MAX_CHARACTER_EDGES = 1000;
 
 // Token bucket config
 const TOKEN_BUCKET_CAPACITY = 90;
@@ -233,6 +234,21 @@ export class AnilistClient {
         return this.runWithRetry(fn, attempt + 1);
       }
 
+      // Transient network errors (DNS/TCP/TLS). Obsidian's requestUrl throws WITHOUT a
+      // status on these failures, so the status-based paths above never catch them and the
+      // whole sync aborts. Treat an error lacking a status (or a TypeError, e.g. "Failed to
+      // fetch") as transient and retry up to 3x with exponential backoff before rethrowing.
+      if ((e?.status === undefined || e?.status === null || !Number.isFinite(e.status)) || err instanceof TypeError) {
+        if (attempt <= 3) {
+          const waitMs = 1000 * 2 ** (attempt - 1);
+          this.onRetry?.({ attempt, waitMs, reason: "network" });
+          this.onLog?.(`  !! retry #${attempt} for transient network error (${err?.constructor?.name ?? "Error"}), sleeping ${waitMs}ms`);
+          await sleep(waitMs);
+          return this.runWithRetry(fn, attempt + 1);
+        }
+        this.onLog?.(`  !! exhausted retries for transient network error, giving up`);
+      }
+
       throw err;
     }
   }
@@ -335,8 +351,10 @@ export class AnilistClient {
 
         if (!conn.pageInfo?.hasNextPage) break;
         page += 1;
-        if (page > 50) {
-          this.onLog?.(`  [${type}:${mediaId}] hit page cap (50), stopping at ${edgeMap.size} chars`);
+        // Cap on total collected edges (not raw page count), so a huge cast isn't truncated
+        // at ~600 edges while hasNextPage is still true and the engine believes it's complete.
+        if (edgeMap.size > MAX_CHARACTER_EDGES) {
+          this.onLog?.(`  [${type}:${mediaId}] collected ${edgeMap.size} chars, hit edge cap (${MAX_CHARACTER_EDGES}), stopping`);
           break;
         }
       } catch (err) {
@@ -359,7 +377,11 @@ export class AnilistClient {
           throw err;
         }
 
-        throw err;
+        // Transient error (5xx/network) below the consecutive-failure cap: back off and retry
+        // the same page before giving up. Keeps the existing page loop semantics intact.
+        this.onLog?.(`  ! retrying page ${page} after transient error (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES})`);
+        await sleep(1000 * 2 ** (consecutiveFailures - 1));
+        continue;
       }
     }
 
