@@ -15,14 +15,6 @@ export interface OpenRouterMessage {
   content: string;
 }
 
-export interface ChatCompletionRequest {
-  model: string;
-  messages: OpenRouterMessage[];
-  stream?: boolean;
-  temperature?: number;
-  max_tokens?: number;
-}
-
 export interface ChatCompletionResponse {
   id: string;
   choices: {

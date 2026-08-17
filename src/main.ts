@@ -1,21 +1,45 @@
-import { Notice, Plugin, TFile, WorkspaceLeaf } from "obsidian";
+import { App, Modal, Notice, Plugin, TFile, WorkspaceLeaf } from "obsidian";
 import { ChatView, CHAT_VIEW_TYPE } from "./chat/view";
-import { AnisyncSettings, DEFAULT_SETTINGS } from "./settings";
+import { VaultContext } from "./chat/vaultContext";
+import { AnisyncSettings, DEFAULT_GRAPH_COLORS, DEFAULT_SETTINGS } from "./settings";
 import { AnisyncSettingTab } from "./settingsTab";
 import { AnilistClient } from "./anilist/client";
 import { SyncEngine, VaultAdapter, CacheStore } from "./sync/engine";
 import { AnisyncCache, emptyCache } from "./sync/cache";
+import { slugifyTag } from "./notes/slugify";
 import {
   openAuthorizePopup,
-  handleDeepLinkToken,
   clearAnilistCredentials,
   probeAnilistConnection,
 } from "./auth/implicit";
 
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+  timestamp: number;
+}
+
+interface ChatSession {
+  id: string;
+  title: string;
+  messages: ChatMessage[];
+  createdAt: number;
+  updatedAt: number;
+}
+
 interface AnisyncData {
   settings: AnisyncSettings;
   cache: AnisyncCache;
+  chatSessions: ChatSession[];
+  activeChatId: string | null;
 }
+
+export interface SyncLogEntry {
+  timestamp: string;
+  message: string;
+}
+
+const MAX_SYNC_LOG_ENTRIES = 500;
 
 class SyncProgressPopup {
   private el: HTMLDivElement | null = null;
@@ -67,14 +91,18 @@ export default class AnisyncPlugin extends Plugin {
   private syncIntervalId: number | null = null;
   private settingTab: AnisyncSettingTab | null = null;
   private syncPopup = new SyncProgressPopup();
+  private syncLog: SyncLogEntry[] = [];
+  private logListeners: (() => void)[] = [];
+  vaultContext: VaultContext | null = null;
+  private tagLinksMigrated = false;
+  private authErrorNoticeShown = false;
+  private loadPromise: Promise<void> | null = null;
 
   async onload(): Promise<void> {
-    await this.loadAll();
-
     this.registerObsidianProtocolHandler("ani-sync", (params) => {
       const token = params.token;
       if (token) {
-        void handleDeepLinkToken(this, token);
+        void this.handleProtocolToken(token);
       }
     });
 
@@ -136,10 +164,105 @@ export default class AnisyncPlugin extends Plugin {
       },
     });
 
+    this.addCommand({
+      id: "refresh-plugin",
+      name: "Refresh plugin (reload sync cache and UI)",
+      hotkeys: [{ modifiers: ["Mod", "Shift"], key: "r" }],
+      callback: () => {
+        void this.refreshPlugin();
+      },
+    });
+
     this.registerView(CHAT_VIEW_TYPE, (leaf: WorkspaceLeaf) => new ChatView(leaf, this));
 
-    if (this.settings.enableAutoSync && this.canSync()) {
-      this.startAutoSync();
+    // Defer heavy data.json parsing off the main thread until layout is ready.
+    this.app.workspace.onLayoutReady(() => {
+      void this.ensureLoaded().then(() => {
+        if (this.settings.enableAutoSync && this.canSync()) {
+          this.startAutoSync();
+        }
+        void this.maybeFixTagWikiLinks();
+      }).catch((e) => {
+        console.error("[Ani-sync] init after layout failed", e);
+      });
+    });
+  }
+
+  private async ensureLoaded(): Promise<void> {
+    if (!this.loadPromise) {
+      this.loadPromise = this.loadAll();
+    }
+    return this.loadPromise;
+  }
+
+  private async maybeFixTagWikiLinks(): Promise<void> {
+    if (this.tagLinksMigrated) return;
+    this.tagLinksMigrated = true;
+    await this.fixTagWikiLinks();
+  }
+
+  private async fixTagWikiLinks(): Promise<void> {
+    // Scope all operations under the configured outputDir so we never touch
+    // user files at the vault root (the engine writes under outputDir).
+    const outputDir = (this.settings.outputDir ?? "Ani-sync").replace(/^\/+|\/+$/g, "") || "Ani-sync";
+    const tagPrefix = `${outputDir}/Tags/`;
+    const animePrefix = `${outputDir}/Anime/`;
+    const mangaPrefix = `${outputDir}/Manga/`;
+
+    // Step 1: Rename tag files from Title Case (e.g. "Super Power.md") to lowercase-hyphen (e.g. "super-power.md")
+    const tagFolder = this.app.vault.getMarkdownFiles().filter(f => f.path.startsWith(tagPrefix));
+    let renamedCount = 0;
+    for (const file of tagFolder) {
+      const basename = file.basename;
+      const correctName = slugifyTag(basename);
+      if (correctName !== basename) {
+        const newPath = `${tagPrefix}${correctName}.md`;
+        try {
+          const existing = this.app.vault.getAbstractFileByPath(newPath);
+          if (!existing) {
+            const content = await this.app.vault.read(file);
+            await this.app.vault.create(newPath, content);
+            await this.app.vault.delete(file);
+            renamedCount++;
+          } else {
+            // Target already exists — skip to avoid data loss, do NOT delete the old file.
+            console.warn(`[Ani-sync] Skipping tag rename: ${newPath} already exists`);
+          }
+        } catch (e) {
+          console.error(`[Ani-sync] Failed to rename tag file: ${basename}`, e);
+        }
+      }
+    }
+    if (renamedCount > 0) {
+      console.log(`[Ani-sync] Renamed ${renamedCount} tag files to lowercase-hyphen`);
+    }
+
+    // Step 2: Fix wiki-links in media notes that reference Tags/ with incorrect slug format
+    const folders = [animePrefix, mangaPrefix];
+    let fixedCount = 0;
+    for (const folder of folders) {
+      const files = this.app.vault.getMarkdownFiles().filter(f => f.path.startsWith(folder));
+      for (const file of files) {
+        let content = await this.app.vault.read(file);
+        // Match any wiki-link to Tags/ folder
+        const regex = /\[\[Tags\/([^|\]]+)\|([^\]]+)\]\]/g;
+        let changed = false;
+        content = content.replace(regex, (match, slug: string, display: string) => {
+          const correctSlug = slugifyTag(display);
+          if (correctSlug !== slug) {
+            changed = true;
+            return `[[${tagPrefix}${correctSlug}|${display}]]`;
+          }
+          return match;
+        });
+        if (changed) {
+          await this.app.vault.modify(file, content);
+          fixedCount++;
+        }
+      }
+    }
+    if (fixedCount > 0) {
+      console.log(`[Ani-sync] Fixed tag wiki-links in ${fixedCount} files`);
     }
   }
 
@@ -150,6 +273,9 @@ export default class AnisyncPlugin extends Plugin {
     this.app.workspace.detachLeavesOfType(CHAT_VIEW_TYPE);
   }
 
+  chatSessions: ChatSession[] = [];
+  activeChatId: string | null = null;
+
   async loadAll(): Promise<void> {
     const raw = (await this.loadData()) as Partial<AnisyncData> | null;
     if (raw && typeof raw === "object") {
@@ -159,15 +285,20 @@ export default class AnisyncPlugin extends Plugin {
           loaded.pollIntervalSeconds = Math.max(30, ((loaded.pollIntervalMinutes as number) || 30) * 60);
           delete loaded.pollIntervalMinutes;
         }
-        this.settings = { ...DEFAULT_SETTINGS, ...(loaded as Partial<AnisyncSettings>) };
+        this.settings = {
+          ...DEFAULT_SETTINGS,
+          ...(loaded as Partial<AnisyncSettings>),
+          graphColors: { ...DEFAULT_GRAPH_COLORS, ...((loaded as Partial<AnisyncSettings>).graphColors ?? {}) },
+        };
       }
       if (raw.cache && typeof raw.cache === "object" && raw.cache.version === 1) {
         this.cache = raw.cache;
       }
-    } else {
-      const legacy = raw as Partial<AnisyncSettings> | null;
-      if (legacy && typeof legacy === "object") {
-        this.settings = { ...DEFAULT_SETTINGS, ...legacy };
+      if (Array.isArray(raw.chatSessions)) {
+        this.chatSessions = raw.chatSessions;
+      }
+      if (raw.activeChatId) {
+        this.activeChatId = raw.activeChatId;
       }
     }
   }
@@ -177,8 +308,87 @@ export default class AnisyncPlugin extends Plugin {
   }
 
   async saveAll(): Promise<void> {
-    const data: AnisyncData = { settings: this.settings, cache: this.cache };
+    const data: AnisyncData = {
+      settings: this.settings,
+      cache: this.cache,
+      chatSessions: this.chatSessions,
+      activeChatId: this.activeChatId,
+    };
     await this.saveData(data);
+  }
+
+  getActiveChatMessages(): ChatMessage[] {
+    if (!this.activeChatId) return [];
+    const session = this.chatSessions.find(s => s.id === this.activeChatId);
+    return session?.messages ?? [];
+  }
+
+  saveChatMessage(role: "user" | "assistant", content: string): void {
+    if (!this.activeChatId) {
+      this.activeChatId = this.generateSessionId();
+    }
+    let session = this.chatSessions.find(s => s.id === this.activeChatId);
+    if (!session) {
+      session = {
+        id: this.activeChatId,
+        title: this.getChatTitle(content),
+        messages: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      this.chatSessions.push(session);
+    }
+    session.messages.push({ role, content, timestamp: Date.now() });
+    session.updatedAt = Date.now();
+    if (session.messages.length > 50) {
+      session.messages = session.messages.slice(-50);
+    }
+    void this.saveAll().catch((e) => console.error("[Ani-sync] save failed", e));
+  }
+
+  startNewChat(): string {
+    const newId = this.generateSessionId();
+    this.activeChatId = newId;
+    this.chatSessions.push({
+      id: newId,
+      title: "New Chat",
+      messages: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    void this.saveAll().catch((e) => console.error("[Ani-sync] save failed", e));
+    return newId;
+  }
+
+  getAllChatSessions(): ChatSession[] {
+    return [...this.chatSessions].sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  loadChatSession(sessionId: string): void {
+    this.activeChatId = sessionId;
+    void this.saveAll().catch((e) => console.error("[Ani-sync] save failed", e));
+  }
+
+  deleteChatSession(sessionId: string): void {
+    this.chatSessions = this.chatSessions.filter(s => s.id !== sessionId);
+    if (this.activeChatId === sessionId) {
+      this.activeChatId = this.chatSessions.length > 0 ? this.chatSessions[0].id : null;
+    }
+    void this.saveAll().catch((e) => console.error("[Ani-sync] save failed", e));
+  }
+
+  deleteAllChatSessions(): void {
+    this.chatSessions = [];
+    this.activeChatId = null;
+    void this.saveAll().catch((e) => console.error("[Ani-sync] save failed", e));
+  }
+
+  private generateSessionId(): string {
+    return `chat_${Date.now()}_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+  }
+
+  private getChatTitle(firstMessage: string): string {
+    return firstMessage.slice(0, 40) + (firstMessage.length > 40 ? "..." : "");
   }
 
   canSync(): boolean {
@@ -198,6 +408,55 @@ export default class AnisyncPlugin extends Plugin {
     this.syncEngine?.cancel();
     this.syncPopup.hide();
     await clearAnilistCredentials(this);
+  }
+
+  private async handleProtocolToken(token: string): Promise<void> {
+    if (!token || token.length < 10) {
+      new Notice("Invalid token received.", 5000);
+      return;
+    }
+
+    // Ensure settings/data are loaded before mutating, so we never overwrite a
+    // real data.json with defaults.
+    await this.ensureLoaded();
+
+    // Verify the token by fetching the AniList Viewer before accepting it.
+    const client = new AnilistClient(token);
+    let viewerName: string | null = null;
+    try {
+      const viewer = await client.fetchViewer();
+      viewerName = viewer?.name ?? null;
+    } catch (e) {
+      console.error("[Ani-sync] token verification failed; ignoring token", e);
+      return;
+    }
+    if (!viewerName) {
+      console.error("[Ani-sync] token verification returned no viewer; ignoring token");
+      return;
+    }
+
+    const confirmed = await this.confirmConnect(viewerName);
+    if (!confirmed) {
+      new Notice("Ani-sync: connection cancelled.", 3000);
+      return;
+    }
+
+    this.stopAutoSync();
+    this.settings.anilistToken = token;
+    this.settings.anilistUsername = viewerName;
+    await this.saveAll();
+    this.refreshSettingsTab();
+    new Notice(`Ani-sync: connected to AniList as @${viewerName}.`, 4000);
+    if (this.settings.enableAutoSync && this.canSync()) {
+      this.startAutoSync();
+    }
+  }
+
+  private confirmConnect(viewerName: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const modal = new ConnectConfirmModal(this.app, viewerName, (ok) => resolve(ok));
+      modal.open();
+    });
   }
 
   startAutoSync(): void {
@@ -299,7 +558,7 @@ export default class AnisyncPlugin extends Plugin {
       outputDir: this.settings.outputDir,
       username: this.settings.anilistUsername,
       cache: this.cache,
-      onLog: () => {},
+      onLog: (msg) => this.pushLog(msg),
       onProgress: (m, p) => {
         this.syncPopup.show(m, p ?? this.estimateProgress(m));
       },
@@ -310,16 +569,29 @@ export default class AnisyncPlugin extends Plugin {
       this.settings.lastSyncAt = new Date().toISOString();
       this.settings.lastSyncStats = `${stats.created} created, ${stats.updated} updated, ${stats.deleted} deleted, ${stats.skipped} unchanged, ${stats.failed} failed`;
       await this.saveAll();
-      try { await this.applyGraphColors(); } catch {}
-      try { this.invalidateChatContext(); } catch {}
+      try { await this.applyGraphColors(); } catch (e) { console.error("[Ani-sync] applyGraphColors failed", e); }
+      try { this.invalidateChatContext(); } catch (e) { console.error("[Ani-sync] invalidateChatContext failed", e); }
       this.syncPopup.show("Sync complete!", 100);
       setTimeout(() => this.syncPopup.hide(), 2000);
       new Notice(`Ani-sync: done — ${stats.created} created, ${stats.updated} updated, ${stats.deleted} deleted, ${stats.skipped} skipped, ${stats.failed} failed`, 6000);
     } catch (e) {
-      const msg = (e as Error)?.message ?? String(e);
+      const err = e as Error & { status?: number };
+      const msg = err?.message ?? String(e);
       this.syncPopup.show(`Failed: ${msg}`, 100);
       setTimeout(() => this.syncPopup.hide(), 3000);
-      new Notice(`Ani-sync sync failed: ${msg}`, 10000);
+      const isAuthError = err?.status === 401 || err?.status === 403 ||
+        /(?:^|[^0-9])(?:401|403)(?:[^0-9]|$)/.test(msg);
+      if (isAuthError) {
+        this.stopAutoSync();
+        await this.disconnectAnilist().catch(() => {});
+        this.refreshSettingsTab();
+        if (!this.authErrorNoticeShown) {
+          this.authErrorNoticeShown = true;
+          new Notice("Ani-sync: AniList authorization invalid/expired — disconnected. Reconnect in settings.", 10000);
+        }
+      } else {
+        new Notice(`Ani-sync sync failed: ${msg}`, 10000);
+      }
     } finally {
       this.syncEngine = null;
     }
@@ -352,20 +624,69 @@ export default class AnisyncPlugin extends Plugin {
     const { workspace } = this.app;
     let leaf = workspace.getLeavesOfType(CHAT_VIEW_TYPE)[0];
     if (!leaf) {
-      const rightLeaf = workspace.getRightLeaf(false);
-      if (!rightLeaf) {
+      // Open in main workspace area (center) instead of sidebar
+      leaf = workspace.getLeaf("tab");
+      if (!leaf) {
         new Notice("Cannot open chat view.", 3000);
         return;
       }
-      leaf = rightLeaf;
       await leaf.setViewState({ type: CHAT_VIEW_TYPE, active: true });
     }
     workspace.revealLeaf(leaf);
   }
 
+  async refreshPlugin(): Promise<void> {
+    // Invalidate vault context to force reload on next chat
+    this.invalidateVaultContext();
+    // Invalidate all open ChatView instances
+    this.invalidateChatContext();
+    // Cancel any active sync operations
+    this.syncEngine?.cancel();
+    // Force a re-sync if auto-sync is enabled
+    if (this.settings.enableAutoSync && this.canSync()) {
+      this.startAutoSync();
+    }
+    new Notice("Plugin refreshed", 2000);
+  }
+
+  invalidateVaultContext(): void {
+    this.vaultContext?.invalidate();
+    this.vaultContext = null;
+  }
+
   async clearCache(): Promise<void> {
     this.cache = emptyCache();
     await this.saveAll();
+  }
+
+  pushLog(message: string): void {
+    const entry: SyncLogEntry = { timestamp: new Date().toISOString(), message };
+    this.syncLog.push(entry);
+    if (this.syncLog.length > MAX_SYNC_LOG_ENTRIES) {
+      this.syncLog.shift();
+    }
+    for (const listener of this.logListeners) {
+      try { listener(); } catch (e) { console.error("[Ani-sync] log listener failed", e); }
+    }
+  }
+
+  getSyncLog(): SyncLogEntry[] {
+    return [...this.syncLog];
+  }
+
+  clearLog(): void {
+    this.syncLog = [];
+    for (const listener of this.logListeners) {
+      try { listener(); } catch (e) { console.error("[Ani-sync] log listener failed", e); }
+    }
+  }
+
+  onLogChange(listener: () => void): () => void {
+    this.logListeners.push(listener);
+    return () => {
+      const idx = this.logListeners.indexOf(listener);
+      if (idx !== -1) this.logListeners.splice(idx, 1);
+    };
   }
 
   private buildVaultAdapter(): VaultAdapter {
@@ -413,5 +734,90 @@ export default class AnisyncPlugin extends Plugin {
         }
       },
     };
+  }
+}
+
+export class ClearCacheConfirmModal extends Modal {
+  private plugin: AnisyncPlugin;
+
+  constructor(app: App, plugin: AnisyncPlugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+
+  onOpen(): void {
+    const { contentEl, titleEl } = this;
+    titleEl.setText("Clear sync cache?");
+
+    contentEl.createEl("p", {
+      text: "This will wipe all cached AniList data, triggering a full re-download on the next sync. This can use a large portion of your AniList API rate limit and may result in temporary rate-limiting if you re-sync immediately.",
+    });
+
+    const btnDiv = contentEl.createDiv({ cls: "modal-button-container" });
+
+    const cancelBtn = btnDiv.createEl("button", { text: "Cancel", cls: "mod-cta" });
+    cancelBtn.onclick = () => this.close();
+
+    const clearBtn = btnDiv.createEl("button", { text: "Clear Cache", cls: "mod-warning" });
+    clearBtn.onclick = async () => {
+      try {
+        await this.plugin.clearCache();
+        new Notice("Cache cleared. Next sync will be a full re-download.", 5000);
+      } catch (e) {
+        new Notice(`Failed to clear cache: ${(e as Error)?.message ?? e}`, 6000);
+      } finally {
+        this.plugin.refreshSettingsTab();
+        this.close();
+      }
+    };
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+class ConnectConfirmModal extends Modal {
+  private viewerName: string;
+  private onConfirm: (ok: boolean) => void;
+  private resolved = false;
+
+  constructor(app: App, viewerName: string, onConfirm: (ok: boolean) => void) {
+    super(app);
+    this.viewerName = viewerName;
+    this.onConfirm = onConfirm;
+  }
+
+  onOpen(): void {
+    const { contentEl, titleEl } = this;
+    titleEl.setText("Connect Ani-sync to AniList?");
+
+    contentEl.createEl("p", {
+      text: `Connect Ani-sync to AniList as @${this.viewerName}?`,
+    });
+
+    const btnDiv = contentEl.createDiv({ cls: "modal-button-container" });
+
+    const cancelBtn = btnDiv.createEl("button", { text: "Cancel", cls: "mod-cta" });
+    cancelBtn.onclick = () => {
+      this.resolved = true;
+      this.onConfirm(false);
+      this.close();
+    };
+
+    const okBtn = btnDiv.createEl("button", { text: "Connect", cls: "mod-warning" });
+    okBtn.onclick = () => {
+      this.resolved = true;
+      this.onConfirm(true);
+      this.close();
+    };
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+    if (!this.resolved) {
+      this.resolved = true;
+      this.onConfirm(false);
+    }
   }
 }

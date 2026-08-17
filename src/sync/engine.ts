@@ -4,8 +4,9 @@ import {
   flattenSummaryToMap,
 } from "../anilist/queries";
 import type { AnilistCharacterConnection, AnilistCharacterEdge, AnilistVoiceActor, MediaDetail, MediaList } from "../types";
-import { buildAll, buildArtifacts, SYNCED_AT_PLACEHOLDER } from "../notes/builder";
-import { extractHashMarker, stripHashMarker, sha256Hex } from "./hash";
+import { buildAll, buildArtifacts, buildStudioArtifact, SYNCED_AT_PLACEHOLDER } from "../notes/builder";
+import { pickTitle } from "../notes/slugify";
+import { extractHashMarker, stripHashMarker, sha256Hex, appendHashMarker } from "./hash";
 import { AnisyncCache, diffSummary } from "./cache";
 
 export interface VaultAdapter {
@@ -77,6 +78,7 @@ export class SyncEngine {
       this.anilist.fetchSummary(this.username),
     ]);
     onProgress(`Viewer: @${viewer.name} (id ${viewer.id})`, 5);
+    this.onLog?.(`Authenticated as @${viewer.name} (ID: ${viewer.id})`);
 
     const outputExists = await this.vault.exists(this.outputDir);
     if (!outputExists) {
@@ -96,38 +98,85 @@ export class SyncEngine {
       .filter(([key, detail]) => newSummary[key] != null && this.needsCharacterRefresh(detail))
       .map(([key]) => key);
     onProgress(`Summary: ${changed.length} changed, ${removed.length} removed, ${unchanged.length} unchanged`, 5);
+    this.onLog?.(`Summary diff: ${changed.length} changed, ${removed.length} removed, ${unchanged.length} unchanged`);
 
     if (changed.length === 0 && removed.length === 0 && staleCharacterDetails.length === 0) {
       onProgress("No changes detected. Cache-only update, skipping list fetches and writes.", 100);
+      this.onLog?.("No changes detected - sync complete (cache-only update)");
       const idleStats: SyncStats = { created: 0, updated: 0, deleted: 0, skipped: unchanged.length, failed: 0, planned: 0 };
-      await this.updateCache(newSummary, cachedDetails);
+      // Idle auto-sync: nothing (summary or character freshness) changed, so the
+      // cache is already authoritative — skip the full cache rewrite/save.
       return idleStats;
     }
 
     if (changed.length === 0 && removed.length > 0) {
-      onProgress(`Only removals detected (${removed.length}). Skipping list fetches...`, 10);
+      onProgress(`Only removals detected (${removed.length}). Cleaning up...`, 10);
+      this.onLog?.(`Processing ${removed.length} removal(s) only`);
       const removalStats: SyncStats = { created: 0, updated: 0, deleted: 0, skipped: 0, failed: 0, planned: 0 };
       await this.handleRemovals(removed, removalStats);
       if (this.cancelled) {
         return this.cancelledStats();
       }
+
+      // Build details map from cached details for remaining entries
       const detailsMap = new Map(cachedDetails);
       for (const k of removed) detailsMap.delete(k);
+
+      // Extract currently active studios/staff directly from remaining cached details
+      const currentStudioIds = new Set<number>();
+      const currentStaffIds = new Set<number>();
+      for (const detail of detailsMap.values()) {
+        for (const edge of detail.studios?.edges ?? []) {
+          if (edge?.node) currentStudioIds.add(edge.node.id);
+        }
+        for (const edge of detail.staff?.edges ?? []) {
+          if (edge?.node) currentStaffIds.add(edge.node.id);
+        }
+      }
+
+      // Identify studios affected by removed media (studios that still have remaining media)
+      const affectedStudioIds = new Set<number>();
+      for (const removedKey of removed) {
+        const removedDetail = cachedDetails.get(removedKey);
+        if (!removedDetail) continue;
+        for (const edge of removedDetail.studios?.edges ?? []) {
+          if (edge?.node && currentStudioIds.has(edge.node.id)) {
+            affectedStudioIds.add(edge.node.id);
+          }
+        }
+      }
+
+      // Rebuild and update affected studio artifacts with refreshed Works lists
+      if (affectedStudioIds.size > 0) {
+        this.onLog?.(`Updating ${affectedStudioIds.size} studio note(s) with refreshed Works lists`);
+        await this.updateStudioArtifacts(affectedStudioIds, detailsMap, removalStats);
+      }
+
+      // Clean up orphaned studio/staff artifacts
+      await this.cleanupSharedArtifacts(removalStats, currentStudioIds, "studio:", "Studio");
+      await this.cleanupSharedArtifacts(removalStats, currentStaffIds, "staff:", "Staff");
+
       await this.updateCache(newSummary, detailsMap);
       onProgress("Done", 100);
       return removalStats;
     }
 
     const fetchKeys = [...new Set([...changed, ...staleCharacterDetails])];
+    // Only fetch a list collection when the changed/incomplete keys actually
+    // include that media type — avoids an unnecessary ANIME/MANGA round-trip.
+    const fetchAnime = fetchKeys.some((k) => k.startsWith("ANIME:"));
+    const fetchManga = fetchKeys.some((k) => k.startsWith("MANGA:"));
     onProgress(`Fetching full lists for ${fetchKeys.length} changed/incomplete entry/entries...`, 7);
+    this.onLog?.(`Fetching full lists for ${fetchKeys.length} changed/incomplete entries`);
     const [fullAnimeLists, fullMangaLists] = await Promise.all([
-      this.anilist.fetchFullList("ANIME", this.username),
-      this.anilist.fetchFullList("MANGA", this.username),
+      fetchAnime ? this.anilist.fetchFullList("ANIME", this.username) : Promise.resolve([] as MediaList[]),
+      fetchManga ? this.anilist.fetchFullList("MANGA", this.username) : Promise.resolve([] as MediaList[]),
     ]);
     const animeCount = countEntries(fullAnimeLists);
     const mangaCount = countEntries(fullMangaLists);
     const totalEntries = animeCount + mangaCount;
     onProgress(`anime: ${animeCount} / manga: ${mangaCount} entries`, 10);
+    this.onLog?.(`Lists fetched: ${animeCount} anime, ${mangaCount} manga entries`);
 
     if (this.cancelled) return this.cancelledStats();
 
@@ -148,6 +197,7 @@ export class SyncEngine {
       }
     }
     onProgress(`Fetching ${toFetch.length} new/changed detail(s) in batch...`, 30);
+    this.onLog?.(`Reusing ${details.size} cached details, fetching ${toFetch.length} new/changed`);
 
     const byType: { ANIME: number[]; MANGA: number[] } = { ANIME: [], MANGA: [] };
     for (const m of toFetch) {
@@ -167,16 +217,45 @@ export class SyncEngine {
     for (const m of fetchedAnime) if (m) details.set(`ANIME:${m.id}`, this.mergeMediaDetail(cachedDetails.get(`ANIME:${m.id}`), m));
     for (const m of fetchedManga) if (m) details.set(`MANGA:${m.id}`, this.mergeMediaDetail(cachedDetails.get(`MANGA:${m.id}`), m));
 
-    const detailsNeedingCharacters = [...details.values()].filter((m) => this.needsCharacterRefresh(m) || !!m.characters?.pageInfo?.hasNextPage);
+    // Collect keys of freshly fetched media — always re-fetch their characters
+    // because the batch query can truncate character data due to complexity limits
+    const freshlyFetchedKeys = new Set<string>();
+    for (const m of fetchedAnime) if (m) freshlyFetchedKeys.add(`ANIME:${m.id}`);
+    for (const m of fetchedManga) if (m) freshlyFetchedKeys.add(`MANGA:${m.id}`);
+
+    const detailsNeedingCharacters = [...details.entries()].filter(([, m]) => {
+      // Trust the batch query's pageInfo: for freshly fetched media the batch
+      // result (characters perPage:50) is kept when it is complete; only re-fetch
+      // when needsCharacterRefresh says the list is incomplete. Cached entries
+      // re-fetch only when their stored character list looks incomplete.
+      return this.needsCharacterRefresh(m);
+    }).map(([, m]) => m);
+
     if (detailsNeedingCharacters.length > 0) {
-      onProgress(`Fetching all characters for ${detailsNeedingCharacters.length} media...`, 32);
+      const freshCount = detailsNeedingCharacters.filter((m) => freshlyFetchedKeys.has(`${m.type}:${m.id}`)).length;
+      this.onLog?.(`  character fetch needed for ${detailsNeedingCharacters.length} media entries (${freshCount} freshly fetched, ${detailsNeedingCharacters.length - freshCount} cache refresh)`);
+      for (const m of detailsNeedingCharacters) {
+        const existing = m.characters?.edges?.length ?? 0;
+        this.onLog?.(`    -> ${m.type}:${m.id} ("${m.title?.userPreferred ?? m.title?.romaji ?? "?"}") [${existing} existing chars]`);
+      }
       await pMapLimit(detailsNeedingCharacters, 4, async (m) => {
         if (this.cancelled) return;
-        const fetchedEdges = await this.anilist.fetchAllCharacters(m.id, m.type);
-        m.characters = this.mergeCharacterConnections(
-          { edges: m.characters?.edges ?? [], pageInfo: { hasNextPage: false } },
-          { edges: fetchedEdges, pageInfo: { hasNextPage: false } },
-        );
+        const isFresh = freshlyFetchedKeys.has(`${m.type}:${m.id}`);
+        try {
+          // Fresh media already has page-1 edges from the batch query, so start at
+          // page 2 and merge into the existing edges rather than overwriting them.
+          const startPage = isFresh ? 2 : 1;
+          const fetchedEdges = await this.anilist.fetchAllCharacters(m.id, m.type, startPage);
+          const existingEdges = isFresh ? (m.characters?.edges ?? []) : [];
+          this.onLog?.(`  ${m.type}:${m.id}: fetched ${fetchedEdges.length} characters (startPage ${startPage})`);
+          m.characters = {
+            edges: [...existingEdges, ...fetchedEdges],
+            pageInfo: { hasNextPage: false },
+          };
+        } catch (err) {
+          this.onLog?.(`  ! character fetch failed for ${m.type}:${m.id}: ${sanitizeLog(String((err as Error)?.message ?? String(err)))}`);
+          m.characters = undefined;
+        }
       });
     }
 
@@ -188,18 +267,26 @@ export class SyncEngine {
       }
     }
     onProgress(`Detail fetch complete: ${details.size} total`, 50);
+    this.onLog?.(`Detail fetch complete: ${details.size} total details loaded`);
 
     if (this.cancelled) return this.cancelledStats();
 
     const built = buildAll(viewer, fullAnimeLists, fullMangaLists, details);
+    const { mediaToStudios, mediaToStaff, mediaToTags } = built;
     const artifacts = buildArtifacts(built, this.syncedAt);
     const totalFiles = artifacts.length;
     const totalFolders = new Set(artifacts.map(a => a.folder)).size;
     onProgress(`Artifacts planned: ${totalFiles} files, ${totalFolders} folders`, 55);
+    this.onLog?.(`Artifacts: ${totalFiles} files across ${totalFolders} folders`);
 
     onProgress("Pre-computing hashes...", 57);
-    const prepared = await this.prepareArtifacts(artifacts);
-    onProgress(`Hashes computed: ${prepared.length}`, 60);
+    const changedKeys = new Set(changed);
+    const removedKeys = new Set(removed);
+    const prepared = await this.prepareArtifacts(artifacts, changedKeys, removedKeys, cachedDetails, mediaToStudios, mediaToStaff, mediaToTags);
+    const skippedCount = prepared.filter(p => p.skipped).length;
+    const toProcess = prepared.length - skippedCount;
+    onProgress(`Hashes computed: ${toProcess} new/changed (${skippedCount} cached)`, 60);
+    this.onLog?.(`Hashes computed for ${toProcess} artifacts (${skippedCount} unchanged, skipped)`);
 
     if (this.cancelled) return this.cancelledStats();
 
@@ -207,10 +294,22 @@ export class SyncEngine {
       onProgress(`${filesDone}/${totalF} files (${foldersDone}/${totalFolders} folders)`, 60 + Math.round((filesDone / totalF) * 30));
     });
 
-    if (this.cancelled) return stats;
+    if (this.cancelled) {
+      this.onLog?.("Sync cancelled by user");
+      return stats;
+    }
+
+    this.onLog?.(`Write complete: ${stats.created} created, ${stats.updated} updated, ${stats.skipped} skipped, ${stats.failed} problems`);
 
     onProgress(`Removing ${removed.length} obsolete note(s)...`, 92);
+    this.onLog?.(`Removing ${removed.length} obsolete note(s)`);
     await this.handleRemovals(removed, stats);
+
+    // Clean up orphaned studio/staff artifacts
+    const currentStudioIds = new Set(built.studios.keys());
+    const currentStaffIds = new Set(built.staff.keys());
+    await this.cleanupSharedArtifacts(stats, currentStudioIds, "studio:", "Studio");
+    await this.cleanupSharedArtifacts(stats, currentStaffIds, "staff:", "Staff");
 
     onProgress("Cleaning up legacy Voice-Actor files...", 94);
     await this.cleanupVoiceActorArtifacts(stats);
@@ -220,7 +319,9 @@ export class SyncEngine {
 
     onProgress("Updating cache...", 95);
     await this.updateCache(newSummary, details);
+    this.onLog?.("Cache updated successfully");
 
+    this.onLog?.("Sync complete");
     return stats;
   }
 
@@ -233,9 +334,13 @@ export class SyncEngine {
   }
 
   private needsCharacterRefresh(detail: MediaDetail): boolean {
-    const edges = detail.characters?.edges;
-    if (!Array.isArray(edges) || edges.length === 0) return true;
-    return edges.some((edge) => !edge?.node?.id || !Array.isArray(edge.voiceActors));
+    const conn = detail.characters;
+    if (!conn) return true;
+    const edges = conn.edges;
+    if (!Array.isArray(edges)) return true;
+    if (edges.length === 0) return !!conn.pageInfo?.hasNextPage;
+    if (conn.pageInfo?.hasNextPage) return true;
+    return edges.some((edge) => !edge?.node?.id);
   }
 
   private mergeMediaDetail(existing: MediaDetail | undefined, incoming: MediaDetail): MediaDetail {
@@ -327,15 +432,72 @@ export class SyncEngine {
     return (name ?? "").trim().toLowerCase().replace(/\s+/g, " ");
   }
 
-  private async prepareArtifacts(artifacts: ReturnType<typeof buildArtifacts>): Promise<PreparedArtifact[]> {
-    const stamped: PreparedArtifact[] = artifacts.map((a) => ({
-      artifact: a,
-      bodyForHash: stripHashMarker(a.body.split(SYNCED_AT_PLACEHOLDER).join(this.syncedAt)),
-      noteHash: "",
-    }));
-    const hashes = await Promise.all(stamped.map((p) => sha256Hex(p.bodyForHash)));
-    for (let i = 0; i < stamped.length; i += 1) stamped[i].noteHash = hashes[i];
-    return stamped;
+  private async prepareArtifacts(
+    artifacts: ReturnType<typeof buildArtifacts>,
+    changedKeys: Set<string>,
+    removedKeys: Set<string>,
+    cachedDetails: Map<string, MediaDetail>,
+    mediaToStudios: Map<string, Set<number>>,
+    mediaToStaff: Map<string, Set<number>>,
+    mediaToTags: Map<string, Set<number>>,
+  ): Promise<PreparedArtifact[]> {
+    const cachedHashes = this.cache?.noteHashes ?? {};
+    const needsHash: { a: ReturnType<typeof buildArtifacts>[number]; bodyForHash: string; idx: number }[] = [];
+    const result: (PreparedArtifact | null)[] = new Array(artifacts.length).fill(null);
+
+    // Pre-compute changed entity IDs for O(1) lookups
+    const changedStudioIds = new Set<number>();
+    const changedStaffIds = new Set<number>();
+    const changedTagIds = new Set<number>();
+    for (const changedKey of changedKeys) {
+      const studios = mediaToStudios.get(changedKey);
+      if (studios) for (const id of studios) changedStudioIds.add(id);
+      const staff = mediaToStaff.get(changedKey);
+      if (staff) for (const id of staff) changedStaffIds.add(id);
+      const tags = mediaToTags.get(changedKey);
+      if (tags) for (const id of tags) changedTagIds.add(id);
+    }
+
+    // Also track studios/staff affected by removed media
+    const removedStudioIds = new Set<number>();
+    const removedStaffIds = new Set<number>();
+    for (const removedKey of removedKeys) {
+      const detail = cachedDetails.get(removedKey);
+      if (!detail) continue;
+      for (const edge of detail.studios?.edges ?? []) {
+        if (edge?.node) removedStudioIds.add(edge.node.id);
+      }
+      for (const edge of detail.staff?.edges ?? []) {
+        if (edge?.node) removedStaffIds.add(edge.node.id);
+      }
+    }
+
+    for (let i = 0; i < artifacts.length; i++) {
+      const a = artifacts[i];
+      const cachedHash = cachedHashes[a.uniqueKey];
+
+      // Skip hashing if: has cached hash AND source not changed
+      if (cachedHash != null && !artifactNeedsUpdate(a.uniqueKey, changedKeys, changedStudioIds, changedStaffIds, changedTagIds, removedStudioIds, removedStaffIds)) {
+        result[i] = { artifact: a, bodyForHash: "", noteHash: cachedHash, skipped: true };
+        continue;
+      }
+
+      // Hash from the body with the syncedAt placeholder INTACT so a fresh
+      // timestamp alone never defeats the "skip if unchanged" check. The real
+      // timestamp is substituted into the body only at write time.
+      const bodyForHash = stripHashMarker(a.body);
+      needsHash.push({ a, bodyForHash, idx: i });
+    }
+
+    // Hash only the ones that need it
+    const hashes = await Promise.all(needsHash.map((p) => sha256Hex(p.bodyForHash)));
+
+    for (let i = 0; i < needsHash.length; i++) {
+      const { a, bodyForHash, idx } = needsHash[i];
+      result[idx] = { artifact: a, bodyForHash, noteHash: hashes[i] };
+    }
+
+    return result as PreparedArtifact[];
   }
 
   private async writeArtifacts(
@@ -374,11 +536,22 @@ export class SyncEngine {
 
     let writtenCount = 0;
     const foldersWithWrites = new Set<string>();
+    const activeCount = resolved.filter(({ p }) => !p.skipped).length;
     await pMapLimit(resolved, WRITE_CONCURRENCY, async ({ p, vaultPath }) => {
       if (this.cancelled) return;
+
+      // Skip artifacts that were determined to be unchanged in prepareArtifacts
+      if (p.skipped) {
+        stats.skipped += 1;
+        return;
+      }
+
       const a = p.artifact;
       const { noteHash, bodyForHash } = p;
       const cachedHash = noteHashes[a.uniqueKey];
+      // Substitute the real timestamp into the placeholder-intact body only here,
+      // at write time. The stored hash is over the placeholder-intact body.
+      const writeBody = bodyForHash.split(SYNCED_AT_PLACEHOLDER).join(this.syncedAt);
 
       try {
         if (cachedHash === noteHash) {
@@ -389,7 +562,7 @@ export class SyncEngine {
         }
 
         if (cachedHash == null) {
-          const finalContent = `${bodyForHash.replace(/\s+$/g, "")}\n\n<!-- anilist-hash: ${noteHash} -->\n`;
+          const finalContent = await appendHashMarker(writeBody, noteHash);
           await this.vault.write(vaultPath, finalContent);
           stats.created += 1;
           noteHashes[a.uniqueKey] = noteHash;
@@ -405,24 +578,24 @@ export class SyncEngine {
           return;
         }
 
-        const finalContent = `${bodyForHash.replace(/\s+$/g, "")}\n\n<!-- anilist-hash: ${noteHash} -->\n`;
+        const finalContent = await appendHashMarker(writeBody, noteHash);
         await this.vault.write(vaultPath, finalContent);
         stats[existing == null ? "created" : "updated"] += 1;
         noteHashes[a.uniqueKey] = noteHash;
         newPaths[a.uniqueKey] = vaultPath;
       } catch (e) {
         stats.failed += 1;
-        this.onLog?.(`  ! write failed for ${vaultPath}: ${(e as Error)?.message ?? e}`);
+        this.onLog?.("  ! write failed for " + vaultPath + ": " + sanitizeLog(String((e as Error)?.message ?? e)));
       } finally {
         writtenCount += 1;
         foldersWithWrites.add(a.folder);
         if (onWriteProgress && writtenCount % 50 === 0) {
-          onWriteProgress(writtenCount, prepared.length, foldersWithWrites.size);
+          onWriteProgress(writtenCount, activeCount, foldersWithWrites.size);
         }
       }
     });
 
-    onWriteProgress?.(prepared.length, prepared.length, foldersWithWrites.size);
+    onWriteProgress?.(activeCount, activeCount, foldersWithWrites.size);
     this.cache = { ...(this.cache ?? {}), noteHashes, paths: newPaths };
     return stats;
   }
@@ -457,7 +630,7 @@ export class SyncEngine {
           delete newPaths[k];
           return;
         }
-        this.onProgress?.(`  ! delete failed for ${vaultPath}: ${(e as Error)?.message}`);
+        this.onProgress?.("  ! delete failed for " + vaultPath + ": " + sanitizeLog(String((e as Error)?.message ?? e)));
       }
     });
 
@@ -466,52 +639,125 @@ export class SyncEngine {
   }
 
   private async cleanupVoiceActorArtifacts(stats: SyncStats): Promise<void> {
-    const paths = this.cache?.paths ?? {};
-    const noteHashes = this.cache?.noteHashes ?? {};
-    const toDelete: { k: string; vaultPath: string }[] = [];
-
-    for (const [key, vaultPath] of Object.entries(paths)) {
-      if (key.startsWith("va:") && vaultPath.includes("/Voice-Actors/")) {
-        toDelete.push({ k: key, vaultPath });
-      }
-    }
-
-    if (toDelete.length === 0) return;
-
-    const deletedKeys: string[] = [];
-    let removed = 0;
-    await pMapLimit(toDelete, DELETE_CONCURRENCY, async ({ k, vaultPath }) => {
-      if (this.cancelled) return;
-      try {
-        await this.vault.delete(vaultPath);
-        stats.deleted += 1;
-        deletedKeys.push(k);
-        removed += 1;
-      } catch (e) {
-        if (/404/.test(String((e as Error)?.message))) {
-          deletedKeys.push(k);
-          removed += 1;
-        } else {
-          this.onLog?.(`  ! cleanup failed for ${vaultPath}: ${(e as Error)?.message ?? e}`);
-        }
-      }
-    });
-    for (const k of deletedKeys) {
-      delete noteHashes[k];
-      delete paths[k];
-    }
-
-    if (removed) this.onProgress?.(`  Voice-Actor clean-up: removed ${removed} file(s)`);
-    this.cache = { ...this.cache, noteHashes, paths };
+    await this.cleanupByPredicate(
+      stats,
+      (key, vaultPath) => key.startsWith("va:") && vaultPath.includes("/Voice-Actors/"),
+      "Voice-Actor",
+    );
   }
 
   private async cleanupLegacyCharacterArtifacts(stats: SyncStats): Promise<void> {
+    await this.cleanupByPredicate(
+      stats,
+      (key, vaultPath) => key.startsWith("character:") && vaultPath.startsWith("Characters/"),
+      "Legacy character",
+    );
+  }
+
+  private async updateStudioArtifacts(
+    affectedStudioIds: Set<number>,
+    detailsMap: Map<string, MediaDetail>,
+    stats: SyncStats,
+  ): Promise<void> {
+    const paths = this.cache?.paths ?? {};
+    const noteHashes = this.cache?.noteHashes ?? {};
+
+    // Build studio data and works lists from remaining media
+    const studioData = new Map<number, { name: string; siteUrl?: string | null; isAnimationStudio: boolean; works: string[] }>();
+    for (const detail of detailsMap.values()) {
+      const mediaTitle = pickTitle(detail.title);
+      for (const edge of detail.studios?.edges ?? []) {
+        if (!edge?.node || !affectedStudioIds.has(edge.node.id)) continue;
+        const studioId = edge.node.id;
+        if (!studioData.has(studioId)) {
+          studioData.set(studioId, {
+            name: edge.node.name,
+            siteUrl: edge.node.siteUrl,
+            isAnimationStudio: edge.node.isAnimationStudio,
+            works: [],
+          });
+        }
+        const studio = studioData.get(studioId)!;
+        if (!studio.works.includes(mediaTitle)) {
+          studio.works.push(mediaTitle);
+        }
+      }
+    }
+
+    // Rebuild and write each affected studio artifact
+    let updated = 0;
+    for (const [studioId, data] of studioData) {
+      if (this.cancelled) break;
+      const uniqueKey = `studio:${studioId}`;
+      const artifact = buildStudioArtifact(
+        { id: studioId, name: data.name, siteUrl: data.siteUrl, isAnimationStudio: data.isAnimationStudio },
+        data.works,
+        this.syncedAt,
+      );
+
+      try {
+        // Compute new hash from the body with the syncedAt placeholder intact, so a
+        // fresh timestamp alone never defeats the "skip if unchanged" check.
+        const bodyForHash = stripHashMarker(artifact.body);
+        const noteHash = await sha256Hex(bodyForHash);
+        const cachedHash = noteHashes[uniqueKey];
+
+        // Skip if unchanged
+        if (cachedHash === noteHash) {
+          continue;
+        }
+
+        // Determine vault path
+        const vaultPath = normalizePath(`${this.outputDir}/${artifact.folder}/${artifact.filename}`);
+
+        // Substitute the real timestamp at write time and append the hash marker.
+        const finalContent = await appendHashMarker(
+          bodyForHash.split(SYNCED_AT_PLACEHOLDER).join(this.syncedAt),
+          noteHash,
+        );
+        await this.vault.write(vaultPath, finalContent);
+        stats.updated += 1;
+        noteHashes[uniqueKey] = noteHash;
+        paths[uniqueKey] = vaultPath;
+        updated += 1;
+      } catch (e) {
+        this.onLog?.(`  ! studio update failed for ${data.name}: ${sanitizeLog(String((e as Error)?.message ?? e))}`);
+        stats.failed += 1;
+      }
+    }
+
+    if (updated) this.onProgress?.(`  Studio updates: ${updated} note(s) refreshed`);
+    this.cache = { ...this.cache, noteHashes, paths };
+  }
+
+  private async cleanupSharedArtifacts(
+    stats: SyncStats,
+    activeIds: Set<number>,
+    prefix: "studio:" | "staff:",
+    label: string,
+  ): Promise<void> {
+    await this.cleanupByPredicate(
+      stats,
+      (key) => {
+        if (!key.startsWith(prefix)) return false;
+        const id = Number(key.slice(prefix.length));
+        return !activeIds.has(id);
+      },
+      label,
+    );
+  }
+
+  private async cleanupByPredicate(
+    stats: SyncStats,
+    predicate: (key: string, vaultPath: string) => boolean,
+    label: string,
+  ): Promise<void> {
     const paths = this.cache?.paths ?? {};
     const noteHashes = this.cache?.noteHashes ?? {};
     const toDelete: { k: string; vaultPath: string }[] = [];
 
     for (const [key, vaultPath] of Object.entries(paths)) {
-      if (key.startsWith("character:") && vaultPath.startsWith("Characters/")) {
+      if (predicate(key, vaultPath)) {
         toDelete.push({ k: key, vaultPath });
       }
     }
@@ -532,7 +778,7 @@ export class SyncEngine {
           deletedKeys.push(k);
           removed += 1;
         } else {
-          this.onLog?.(`  ! legacy character cleanup failed for ${vaultPath}: ${(e as Error)?.message ?? e}`);
+          this.onLog?.("  ! " + label.toLowerCase() + " cleanup failed for " + vaultPath + ": " + sanitizeLog(String((e as Error)?.message ?? e)));
         }
       }
     });
@@ -541,7 +787,7 @@ export class SyncEngine {
       delete paths[k];
     }
 
-    if (removed) this.onProgress?.(`  Legacy character clean-up: removed ${removed} file(s)`);
+    if (removed) this.onProgress?.(`  ${label} clean-up: removed ${removed} file(s)`);
     this.cache = { ...this.cache, noteHashes, paths };
   }
 
@@ -565,10 +811,66 @@ interface PreparedArtifact {
   artifact: ReturnType<typeof buildArtifacts>[number];
   noteHash: string;
   bodyForHash: string;
+  skipped?: boolean;
+}
+
+function sanitizeLog(s: string): string {
+  return s.replace(/[\r\n\t]/g, " ").slice(0, 200);
 }
 
 function countEntries(lists: MediaList[]): number {
   return lists.reduce((acc, l) => acc + l.entries.length, 0);
+}
+
+function artifactNeedsUpdate(
+  uniqueKey: string,
+  changedKeys: Set<string>,
+  changedStudioIds: Set<number>,
+  changedStaffIds: Set<number>,
+  changedTagIds: Set<number>,
+  removedStudioIds: Set<number>,
+  removedStaffIds: Set<number>,
+): boolean {
+  // Media artifacts: uniqueKey IS the media key
+  if (changedKeys.has(uniqueKey)) return true;
+
+  // Character artifacts: "media-characters:{id}" or "media-characters:{slug}"
+  if (uniqueKey.startsWith("media-characters:")) {
+    const source = uniqueKey.slice("media-characters:".length);
+    // Numeric ID — check if source media changed
+    if (/^\d+$/.test(source)) {
+      return changedKeys.has(`ANIME:${source}`) || changedKeys.has(`MANGA:${source}`);
+    }
+    // Slug-based — can't directly match, re-process to be safe
+    return true;
+  }
+
+  // Profile and voice-actor-index: always process
+  if (uniqueKey === "profile" || uniqueKey === "voice-actor-index") return true;
+
+  // Studio artifacts: studio:{id}
+  // Update if the studio had media changed OR if any linked media was removed
+  if (uniqueKey.startsWith("studio:")) {
+    const studioId = Number(uniqueKey.slice("studio:".length));
+    return changedStudioIds.has(studioId) || removedStudioIds.has(studioId);
+  }
+
+  // Staff artifacts: staff:{id}
+  // Update if the staff had media changed OR if any linked media was removed
+  if (uniqueKey.startsWith("staff:")) {
+    const staffId = Number(uniqueKey.slice("staff:".length));
+    return changedStaffIds.has(staffId) || removedStaffIds.has(staffId);
+  }
+
+  // Tag artifacts: tag:{id} or tag:-{hash}
+  if (uniqueKey.startsWith("tag:")) {
+    const tagId = Number(uniqueKey.slice("tag:".length));
+    if (tagId < 0) return true; // synthetic tag (negative ID)
+    if (!Number.isFinite(tagId)) return true; // invalid/malformed ID
+    return changedTagIds.has(tagId);
+  }
+
+  return false;
 }
 
 async function pMapLimit<T>(items: T[], limit: number, fn: (item: T, idx: number) => Promise<void>): Promise<void> {
